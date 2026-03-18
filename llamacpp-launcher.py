@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import json, os, re, subprocess, platform
+import json, os, re, subprocess, platform, threading
 from datetime import datetime
 
 try:
@@ -120,12 +120,12 @@ def parse_help_flags(bin_path: str, binary: str) -> list:
 
     flags = []
     seen  = set()
+    # Pattern: flag(s) column  followed by 2+ spaces  followed by description
+    # Group 1: flags+optional-arg  Group 2: description text
     line_pat = re.compile(
         r'^\s{0,10}'
-        r'((?:-{1,2}[\w][\w\-]*'
-        r'(?:[,\s]+(?:-{1,2}[\w][\w\-]*))*'
-        r'(?:\s+[<\[A-Z][^\s]{0,20})?'
-        r')\s{2,}'
+        r'(--?[\w][\w-]*(?:[\s,]+--?[\w][\w-]*)*(?:\s+\S{1,20})?)'
+        r'\s{2,}'
         r'(.+)',
         re.MULTILINE
     )
@@ -167,9 +167,6 @@ def find_gguf_files(folder: str):
 LLAMA_KEYWORDS = ("llama", "llama-cli", "llama-server", "llama-cpp", "llama.cpp")
 
 def get_llama_processes(name_filter: str = ""):
-    """Return list of (pid, name, rss_bytes) for running llama.cpp processes.
-    name_filter: if given, match only processes whose name starts with it (no cmdline scan).
-    """
     if not HAS_PSUTIL:
         return []
     procs = []
@@ -206,7 +203,7 @@ def total_ram_bytes() -> int:
     except Exception:
         return 1
 
-_TOTAL_RAM = total_ram_bytes()  # constante, cachear una sola vez
+_TOTAL_RAM = total_ram_bytes()
 
 # ── Paleta ────────────────────────────────────────────────────────────────────
 IS_WIN    = platform.system() == "Windows"
@@ -224,8 +221,8 @@ RED       = "#f87171"
 CYAN      = "#67e8f9"
 BORDER    = "#3f3f46"
 SEL_BG    = "#292524"
-RAM_BAR   = "#22d3ee"   # color de la barra RAM
-RAM_BG    = "#1e3a3f"   # fondo de la barra RAM
+RAM_BAR   = "#22d3ee"
+RAM_BG    = "#1e3a3f"
 FONT_MONO = ("Consolas", 9)  if IS_WIN else ("Menlo", 9)
 FONT_UI   = ("Segoe UI", 10) if IS_WIN else ("Helvetica Neue", 10)
 FONT_TINY = ("Segoe UI", 8)  if IS_WIN else ("Helvetica Neue", 8)
@@ -245,13 +242,11 @@ class LlamaLauncher(tk.Tk):
         self._ac_popup        = None
         self._ac_job          = None
 
-        # ── Watcher state ────────────────────────────────────────────────────
-        self._last_gguf_snapshot = []   # lista de nombres para comparar
+        self._last_gguf_snapshot = []
         self._gguf_watch_job     = None
-
-        # ── RAM monitor state ────────────────────────────────────────────────
+        self._gguf_size_cache    = {}   # fname -> "X.XGB"
         self._ram_job  = None
-        self._save_job = None  # debounce para save_data
+        self._save_job = None
 
         self.title("LlamaCPP Launcher")
         self.configure(bg=BG)
@@ -276,7 +271,6 @@ class LlamaLauncher(tk.Tk):
         if not HAS_PSUTIL:
             self.log("warn", "psutil not found — RAM monitor disabled (pip install psutil)")
 
-        # Arrancar watchers después de que la UI esté lista
         self._start_gguf_watcher()
         self._start_ram_monitor()
 
@@ -298,13 +292,19 @@ class LlamaLauncher(tk.Tk):
         s.configure("TCheckbutton", background=BG2, foreground=FG2,
                     font=FONT_TINY, focuscolor=BG2)
         s.map("TCheckbutton", background=[("active", BG2)])
-        for nm, bg_c, fg_c in [("Run", ACCENT, BG), ("Sec", BG3, FG), ("Del", BG3, RED)]:
+        for nm, bg_c, fg_c in [
+            ("Sec",      BG3,      FG),
+            ("Del",      BG3,      RED),
+            ("KillBtn",  "#7c1f1f","#fca5a5"),
+            ("OrgBtn",   ACCENT,   BG),
+        ]:
             s.configure(f"{nm}.TButton",
                 background=bg_c, foreground=fg_c, font=FONT_UI,
                 borderwidth=0, focuscolor=bg_c, padding=(10, 6))
-        s.map("Run.TButton", background=[("active", ACCENT2),   ("pressed", "#ea6c0a")])
-        s.map("Sec.TButton", background=[("active", BORDER),    ("pressed", BG2)])
-        s.map("Del.TButton", background=[("active", "#3f1515"), ("pressed", "#2a0a0a")])
+        s.map("Sec.TButton",     background=[("active", BORDER),    ("pressed", BG2)])
+        s.map("Del.TButton",     background=[("active", "#3f1515"), ("pressed", "#2a0a0a")])
+        s.map("KillBtn.TButton", background=[("active", "#a02525"), ("pressed", "#5a1515")])
+        s.map("OrgBtn.TButton",  background=[("active", ACCENT2),   ("pressed", "#ea6c0a")])
         s.configure("TSpinbox",
             fieldbackground=BG3, foreground=FG, insertcolor=FG,
             arrowcolor=FG2, bordercolor=BORDER, font=FONT_MONO)
@@ -314,12 +314,10 @@ class LlamaLauncher(tk.Tk):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        # Row 0: Header
         hdr = ttk.Frame(self, padding=(18, 14, 18, 0))
         hdr.grid(row=0, column=0, sticky="ew")
         ttk.Label(hdr, text="🦙 LlamaCPP Launcher", style="Head.TLabel").pack(side="left")
 
-        # Row 1: Body (3 columns)
         body = ttk.Frame(self, padding=(18, 12, 18, 8))
         body.grid(row=1, column=0, sticky="nsew")
         body.columnconfigure(0, weight=1, minsize=170)
@@ -333,34 +331,15 @@ class LlamaLauncher(tk.Tk):
         tk.Frame(body, bg=BORDER, width=1).grid(row=0, column=3, rowspan=3, sticky="ns", padx=12)
         self._build_gguf_panel(body)
 
-        # Row 2: sep
         tk.Frame(self, bg=BORDER, height=1).grid(row=2, column=0, sticky="ew", padx=18)
-
-        # Row 3: Quick params
         self._build_params_panel()
-
-        # Row 4: sep
         tk.Frame(self, bg=BORDER, height=1).grid(row=4, column=0, sticky="ew", padx=18)
-
-        # Row 5: Preview
         self._build_preview_panel()
-
-        # Row 6: sep
         tk.Frame(self, bg=BORDER, height=1).grid(row=6, column=0, sticky="ew", padx=18)
-
-        # Row 7: Footer paths
         self._build_footer()
-
-        # Row 8: sep
         tk.Frame(self, bg=BORDER, height=1).grid(row=8, column=0, sticky="ew", padx=18)
-
-        # Row 9: RAM monitor
         self._build_ram_panel()
-
-        # Row 10: sep
         tk.Frame(self, bg=BORDER, height=1).grid(row=10, column=0, sticky="ew", padx=18)
-
-        # Row 11: Log
         self._build_log_panel()
 
     # ── Panel: comandos ───────────────────────────────────────────────────────
@@ -424,8 +403,13 @@ class LlamaLauncher(tk.Tk):
         eb.grid(row=4, column=0, sticky="ew")
         ttk.Button(eb, text="Save", style="Sec.TButton",
                    command=self._save_command).pack(side="left", padx=(0, 8))
-        ttk.Button(eb, text="▶  Run", style="Run.TButton",
-                   command=self._run_command).pack(side="right")
+        # ── Acción: Launch / Relaunch / Kill (de derecha a izquierda con pack right) ──
+        ttk.Button(eb, text="▶ Launch",   style="OrgBtn.TButton",
+                   command=self._run_command).pack(side="right", padx=(4, 0))
+        ttk.Button(eb, text="⟳ Relaunch", style="OrgBtn.TButton",
+                   command=self._relaunch).pack(side="right", padx=(4, 0))
+        ttk.Button(eb, text="✕ Kill",     style="KillBtn.TButton",
+                   command=self._kill_only).pack(side="right", padx=(4, 0))
 
     # ── Panel: GGUF ───────────────────────────────────────────────────────────
     def _build_gguf_panel(self, parent):
@@ -463,7 +447,6 @@ class LlamaLauncher(tk.Tk):
         self.gguf_listbox.configure(yscrollcommand=sb2.set, xscrollcommand=sb2h.set)
         self.gguf_listbox.bind("<<ListboxSelect>>", lambda e: self._on_gguf_select())
 
-        # Fila de status + indicador de watcher
         status_row = tk.Frame(parent, bg=BG)
         status_row.grid(row=2, column=4, sticky="ew", pady=(4, 0))
 
@@ -633,8 +616,6 @@ class LlamaLauncher(tk.Tk):
         self._ram_label = tk.Label(f, text="—", bg=BG, fg=FG_DIM, font=FONT_TINY, anchor="w")
         self._ram_label.pack(side="left")
 
-
-
     # ── Log panel ─────────────────────────────────────────────────────────────
     def _build_log_panel(self):
         lf = ttk.Frame(self, padding=(18, 6, 18, 14))
@@ -688,35 +669,44 @@ class LlamaLauncher(tk.Tk):
 
     # ── GGUF directory watcher ────────────────────────────────────────────────
     def _start_gguf_watcher(self):
-        """Arranca el polling de 3s del directorio GGUF."""
         folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
         self._last_gguf_snapshot = find_gguf_files(folder)
         self._poll_gguf_dir()
 
     def _poll_gguf_dir(self):
-        """Compara el estado actual del directorio con el snapshot anterior."""
-        try:
-            folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
-            if not folder or not os.path.isdir(folder):
-                self._gguf_watch_job = self.after(3000, self._poll_gguf_dir)
-                return
-            current = find_gguf_files(folder)
-            if current != self._last_gguf_snapshot:
-                added   = set(current) - set(self._last_gguf_snapshot)
-                removed = set(self._last_gguf_snapshot) - set(current)
-                self._last_gguf_snapshot = current
-                self._refresh_gguf_list()
-                for f in added:
-                    self.log("ok", f"GGUF added: {f}")
-                for f in removed:
-                    self.log("warn", f"GGUF removed: {f}")
-                self._flash_watch_indicator()
-        except Exception as exc:
-            print(f"[gguf watcher error] {exc}")
+        """Lanza el scan del directorio en un thread; la UI se actualiza vía after(0)."""
+        folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
+        if not folder or not os.path.isdir(folder):
+            self._gguf_watch_job = self.after(3000, self._poll_gguf_dir)
+            return
+
+        snapshot = list(self._last_gguf_snapshot)
+
+        def _worker():
+            try:
+                current = find_gguf_files(folder)
+            except Exception as exc:
+                print(f"[gguf watcher error] {exc}")
+                current = snapshot
+            self.after(0, lambda: self._on_gguf_poll_result(current, snapshot, folder))
+
+        threading.Thread(target=_worker, daemon=True).start()
         self._gguf_watch_job = self.after(3000, self._poll_gguf_dir)
 
+    def _on_gguf_poll_result(self, current: list, snapshot: list, folder: str):
+        """Callback en hilo principal con el resultado del scan de directorio."""
+        if current != snapshot:
+            added   = set(current) - set(snapshot)
+            removed = set(snapshot) - set(current)
+            self._last_gguf_snapshot = current
+            self._refresh_gguf_list()
+            for f in added:
+                self.log("ok", f"GGUF added: {f}")
+            for f in removed:
+                self.log("warn", f"GGUF removed: {f}")
+            self._flash_watch_indicator()
+
     def _flash_watch_indicator(self):
-        """Breve destello en el indicador '⟳ watching' al detectar cambios."""
         try:
             self.gguf_watch_indicator.config(foreground=GREEN)
             self.after(800, lambda: self.gguf_watch_indicator.config(foreground=FG_DIM))
@@ -728,28 +718,39 @@ class LlamaLauncher(tk.Tk):
         self._ram_job = self.after(2000, self._poll_ram)
 
     def _poll_ram(self):
-        try:
-            if not HAS_PSUTIL:
-                self._ram_label.config(text="pip install psutil to enable", fg=FG_DIM)
-            else:
-                own_pid = os.getpid()
-                cur_bin = os.path.splitext(self._get_current_binary().lower())[0]
+        """Lanza la consulta psutil en un thread; actualiza el label vía after(0)."""
+        if not HAS_PSUTIL:
+            self._ram_label.config(text="pip install psutil to enable", fg=FG_DIM)
+            self._ram_job = self.after(2000, self._poll_ram)
+            return
 
-                # Si hay binario conocido: filtrar por nombre directamente (sin cmdline scan)
+        own_pid = os.getpid()
+        cur_bin = os.path.splitext(self._get_current_binary().lower())[0]
+
+        def _worker():
+            try:
                 procs = [p for p in get_llama_processes(name_filter=cur_bin) if p[0] != own_pid]
+            except Exception:
+                procs = []
+            self.after(0, lambda: self._on_ram_poll_result(cur_bin, procs))
 
-                if cur_bin and not procs:
-                    self._ram_label.config(text=f"'{cur_bin}' not running", fg=FG_DIM)
-                elif procs:
-                    total = _TOTAL_RAM or 1
-                    parts = [f"[{pid}] {name}  {fmt_ram(rss)}  ({rss/total*100:.1f}%)"
-                             for pid, name, rss in procs]
-                    self._ram_label.config(text="  |  ".join(parts), fg=GREEN)
-                else:
-                    self._ram_label.config(text="no llama.cpp processes running", fg=FG_DIM)
+        threading.Thread(target=_worker, daemon=True).start()
+        self._ram_job = self.after(2000, self._poll_ram)
+
+    def _on_ram_poll_result(self, cur_bin: str, procs: list):
+        """Callback en hilo principal con el resultado de la consulta de procesos."""
+        try:
+            if cur_bin and not procs:
+                self._ram_label.config(text=f"'{cur_bin}' not running", fg=FG_DIM)
+            elif procs:
+                total = _TOTAL_RAM or 1
+                parts = [f"[{pid}] {name}  {fmt_ram(rss)}  ({rss/total*100:.1f}%)"
+                         for pid, name, rss in procs]
+                self._ram_label.config(text="  |  ".join(parts), fg=GREEN)
+            else:
+                self._ram_label.config(text="no llama.cpp processes running", fg=FG_DIM)
         except Exception as exc:
             print(f"[ram poll error] {exc}")
-        self._ram_job = self.after(2000, self._poll_ram)
 
     # ── Preview ───────────────────────────────────────────────────────────────
     def _schedule_preview(self):
@@ -791,7 +792,7 @@ class LlamaLauncher(tk.Tk):
                 self.data["params"][k] = v.get()
             for k, v in self._param_enabled.items():
                 self.data["params_enabled"][k] = v.get()
-            save_data(self.data)
+            self._schedule_save()       # debounced — no I/O síncrono por tecla
             self._schedule_preview()
         except Exception as exc:
             print(f"[_on_param_change error] {exc}")
@@ -924,10 +925,102 @@ class LlamaLauncher(tk.Tk):
         except Exception as e:
             self.log("err", f"Error: {e}")
 
+    # ── Kill / Relaunch ───────────────────────────────────────────────────────
+    # Nombres de procesos que son terminales / shells; su muerte cierra la ventana
+    _TERMINAL_NAMES = frozenset({
+        # Windows
+        "cmd.exe", "cmd", "powershell.exe", "powershell", "windowsterminal.exe",
+        "conhost.exe",
+        # Linux
+        "bash", "sh", "zsh", "fish",
+        "gnome-terminal-server", "gnome-terminal",
+        "konsole", "xfce4-terminal", "xterm", "lxterminal", "alacritty",
+        "kitty", "tilix",
+        # macOS
+        "terminal", "iterm2", "login",
+    })
+
+    def _kill_processes(self) -> list:
+        """
+        Mata el/los procesos del binario actual MÁS su terminal padre.
+        Devuelve lista de strings descriptivos de lo que se mató.
+        """
+        if not HAS_PSUTIL:
+            self.log("err", "Kill requires psutil (pip install psutil)")
+            return []
+
+        binary   = self._get_current_binary()
+        bin_stem = os.path.splitext(binary.lower())[0]
+        own_pid  = os.getpid()
+
+        if not bin_stem:
+            self.log("warn", "Kill: no binary detected in command")
+            return []
+
+        targets = [p for p in get_llama_processes(name_filter=bin_stem) if p[0] != own_pid]
+        if not targets:
+            self.log("info", f"Kill: no '{bin_stem}' process found")
+            return []
+
+        killed = []
+
+        for pid, name, _ in targets:
+            try:
+                proc = psutil.Process(pid)
+
+                # Capturar el proceso padre ANTES de matar el hijo
+                terminal_proc = None
+                try:
+                    parent = proc.parent()
+                    if parent and parent.name().lower() in self._TERMINAL_NAMES:
+                        terminal_proc = parent
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+                # Matar proceso llama
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                killed.append(f"[{pid}] {name}")
+                self.log("warn", f"Killed: [{pid}] {name}")
+
+                # Matar la ventana terminal padre
+                if terminal_proc:
+                    try:
+                        terminal_proc.terminate()
+                        killed.append(f"[{terminal_proc.pid}] {terminal_proc.name()} (terminal)")
+                        self.log("warn", f"Closed terminal: [{terminal_proc.pid}] {terminal_proc.name()}")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                self.log("warn", f"Could not kill PID {pid}: {e}")
+
+        return killed
+
+    def _kill_only(self):
+        """Botón Kill: mata proceso + terminal, sin relanzar."""
+        killed = self._kill_processes()
+        if not killed:
+            self.log("info", "Kill: nothing to kill")
+
+    def _relaunch(self):
+        """Botón Relaunch: mata proceso + terminal, luego relanza."""
+        killed = self._kill_processes()
+        delay  = 700 if killed else 0   # pausa solo si hubo algo que matar (liberar VRAM)
+        self.after(delay, self._run_command)
+
     # ── Lógica: GGUF ──────────────────────────────────────────────────────────
     def _refresh_gguf_list(self):
         folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else self.data["gguf_path"]
         self._all_gguf_files = find_gguf_files(folder)
+        # Cachear tamaños una sola vez para no hacer getsize en cada keypress del filtro
+        self._gguf_size_cache = {}
+        if folder:
+            for fname in self._all_gguf_files:
+                self._gguf_size_cache[fname] = fmt_size(os.path.join(folder, fname))
         self._apply_gguf_filter()
         if self._all_gguf_files:
             self.log("info", f"GGUF: {len(self._all_gguf_files)} archivos en '{folder}'")
@@ -938,15 +1031,14 @@ class LlamaLauncher(tk.Tk):
         q = self.gguf_filter_var.get().strip().lower() if hasattr(self, "gguf_filter_var") else ""
         if q == "search…":
             q = ""
-        folder  = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
-        files   = [f for f in self._all_gguf_files if q in f.lower()] if q else self._all_gguf_files
+        files = [f for f in self._all_gguf_files if q in f.lower()] if q else self._all_gguf_files
+        size_cache = getattr(self, "_gguf_size_cache", {})
 
         self.gguf_listbox.delete(0, "end")
         for fname in files:
-            size = fmt_size(os.path.join(folder, fname)) if folder else ""
+            size = size_cache.get(fname, "")
             self.gguf_listbox.insert("end", f"  {fname}  [{size}]")
 
-        # Restaurar selección visual si el modelo activo sigue visible
         if self._selected_gguf:
             sel_name = os.path.basename(self._selected_gguf)
             for i, fname in enumerate(files):
@@ -983,6 +1075,7 @@ class LlamaLauncher(tk.Tk):
         return os.path.basename(line) if line else ""
 
     def _fetch_help_flags(self):
+        """Lanza parse_help_flags en un hilo para no bloquear la UI."""
         binary   = self._get_current_binary()
         bin_path = self.bin_var.get().strip()
         if not binary:
@@ -992,7 +1085,17 @@ class LlamaLauncher(tk.Tk):
         self.log("info", f"Parsing --help for: {binary}")
         self.help_status_var.set("Loading…")
         self.update_idletasks()
-        flags = parse_help_flags(bin_path, binary)
+
+        def _worker():
+            flags = parse_help_flags(bin_path, binary)
+            # Actualizar UI desde el hilo principal
+            self.after(0, lambda: self._on_flags_loaded(binary, flags))
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+    def _on_flags_loaded(self, binary: str, flags: list):
+        """Callback en el hilo principal tras cargar los flags."""
         if flags:
             self._help_cache[binary] = flags
             self.data["help_cache"][binary] = flags
@@ -1203,11 +1306,16 @@ class LlamaLauncher(tk.Tk):
         self.cmd_text.bind("<KeyRelease>", self._on_cmd_keyrelease)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
-    def _autosave(self, key, var):
-        self.data[key] = var.get().strip()
+    def _schedule_save(self):
+        """Debounce: escribe a disco 800ms después del último cambio."""
         if self._save_job:
             self.after_cancel(self._save_job)
-        self._save_job = self.after(800, lambda: save_data(self.data))
+        self._save_job = self.after(800, lambda: threading.Thread(
+            target=save_data, args=(dict(self.data),), daemon=True).start())
+
+    def _autosave(self, key, var):
+        self.data[key] = var.get().strip()
+        self._schedule_save()
 
     def _browse_bin(self):
         path = filedialog.askdirectory(title="llama.cpp binaries folder")
@@ -1223,7 +1331,6 @@ class LlamaLauncher(tk.Tk):
             self.log("info", f"Models: {path}")
 
     def _on_close(self):
-        # Cancelar watchers antes de cerrar
         if self._gguf_watch_job:
             self.after_cancel(self._gguf_watch_job)
         if self._ram_job:
