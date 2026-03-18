@@ -10,6 +10,8 @@ Just specify the binaries path and models path, then create commands, choose the
 - Interactive command composition  
 - Compose, save, and run llama.cpp commands  
 - Automatic extraction and parsing of `--help` output for argument suggestions and autocomplete  
+- Process memory monitoring
+
 ![](./img/screen1.png)
 
 
@@ -26,4 +28,5 @@ python.exe llamacpp-launcher.py
 
 All settings and saved commands are stored in a local configuration file:
 ```
-~/llama_launcher.json```
+~/llama_launcher.json
+```

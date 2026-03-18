@@ -3,13 +3,19 @@ from tkinter import ttk, messagebox, filedialog
 import json, os, re, subprocess, platform
 from datetime import datetime
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
 # ── Persistencia ──────────────────────────────────────────────────────────────
 DATA_FILE = os.path.join(os.path.expanduser("~"), ".llama_launcher.json")
 DEFAULT_DATA = {
     "bin_path": "", "gguf_path": "", "commands": [],
     "params": {"ngl": "", "ctx": "", "temp": "", "threads": "", "n": "", "reasoning": "auto"},
     "params_enabled": {"ngl": False, "ctx": False, "temp": False, "threads": False, "n": False, "reasoning": False},
-    "help_cache": {},   # {"/path/to/binary": [{"flag": "--foo", "desc": "..."}]}
+    "help_cache": {},
 }
 
 def load_data():
@@ -68,7 +74,6 @@ def run_in_terminal(bin_path: str, command: str):
 
 # ── Command building ──────────────────────────────────────────────────────────
 def inject_flag(cmd: str, flag: str, value: str) -> str:
-    """Replace <flag> <val> if it exists, otherwise append. Lambda prevents backslash interpretation."""
     pattern = rf'{re.escape(flag)}\s+\S+'
     repl    = f'{flag} {value}'
     if re.search(pattern, cmd):
@@ -90,18 +95,12 @@ def build_final_cmd(base_cmd: str, gguf_path: str, params: dict, params_enabled:
     for key, flag in flag_map.items():
         if params_enabled.get(key) and params.get(key, "").strip():
             cmd = inject_flag(cmd, flag, params[key].strip())
-    # Reasoning param (string value: on/off/auto)
     if params_enabled.get("reasoning") and params.get("reasoning", "").strip():
         cmd = inject_flag(cmd, "--reasoning", params["reasoning"].strip())
     return cmd
 
 # ── Binary --help parser ─────────────────────────────────────────────────────
 def parse_help_flags(bin_path: str, binary: str) -> list:
-    """Run binary --help and return ALL flag variants found (short and long).
-    Each entry: {"flag": str, "desc": str, "aliases": [str]}.
-    Example line:   -t,  --threads N   number of CPU threads
-    Yields both "-t" and "--threads" entries sharing the same desc.
-    """
     exe = binary.strip()
     if not exe:
         return []
@@ -109,7 +108,6 @@ def parse_help_flags(bin_path: str, binary: str) -> list:
         candidate = os.path.join(bin_path, exe)
         if os.path.isfile(candidate):
             exe = candidate
-
     try:
         result = subprocess.run(
             [exe, "--help"],
@@ -122,37 +120,28 @@ def parse_help_flags(bin_path: str, binary: str) -> list:
 
     flags = []
     seen  = set()
-
-    # Match a flag-group line: 1-8 spaces, then flag tokens, then 2+ spaces, then desc
-    # Flag tokens look like: "-t", "--threads", "-ngl", "--n-gpu-layers", etc.
-    # They may be comma/space separated before the description
     line_pat = re.compile(
-        r'^\s{0,10}'           # leading indent
-        r'((?:-{1,2}[\w][\w\-]*'  # first flag token
-        r'(?:[,\s]+(?:-{1,2}[\w][\w\-]*))*'  # optional extra flag tokens
-        r'(?:\s+[<\[A-Z][^\s]{0,20})?'  # optional meta-var like <N>, [on|off], N
-        r')\s{2,}'             # separator (2+ spaces)
-        r'(.+)',               # description
+        r'^\s{0,10}'
+        r'((?:-{1,2}[\w][\w\-]*'
+        r'(?:[,\s]+(?:-{1,2}[\w][\w\-]*))*'
+        r'(?:\s+[<\[A-Z][^\s]{0,20})?'
+        r')\s{2,}'
+        r'(.+)',
         re.MULTILINE
     )
-
     for m in line_pat.finditer(output):
         raw  = m.group(1).strip()
         desc = m.group(2).strip()
-        # Extract all flag tokens from the raw group (tokens starting with -)
         tokens = [t.rstrip(",") for t in re.split(r'[\s,]+', raw)
                   if t.startswith("-") and re.match(r'-{1,2}[\w]', t)]
         if not tokens:
             continue
-        # Build aliases list (all tokens for this line)
         aliases = [t for t in tokens if re.match(r'-{1,2}[\w][\w\-]*$', t)]
         for token in aliases:
             if token not in seen:
                 seen.add(token)
                 flags.append({"flag": token, "desc": desc, "aliases": aliases})
-
     return flags
-
 
 # ── GGUF helpers ──────────────────────────────────────────────────────────────
 def fmt_size(path: str) -> str:
@@ -174,6 +163,51 @@ def find_gguf_files(folder: str):
     except PermissionError:
         return []
 
+# ── RAM helpers ───────────────────────────────────────────────────────────────
+LLAMA_KEYWORDS = ("llama", "llama-cli", "llama-server", "llama-cpp", "llama.cpp")
+
+def get_llama_processes(name_filter: str = ""):
+    """Return list of (pid, name, rss_bytes) for running llama.cpp processes.
+    name_filter: if given, match only processes whose name starts with it (no cmdline scan).
+    """
+    if not HAS_PSUTIL:
+        return []
+    procs = []
+    try:
+        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                pname = (proc.info["name"] or "").lower()
+                if name_filter:
+                    if not pname.startswith(name_filter.lower()):
+                        continue
+                else:
+                    if not any(kw in pname for kw in LLAMA_KEYWORDS):
+                        continue
+                rss = proc.info["memory_info"].rss if proc.info["memory_info"] else 0
+                procs.append((proc.info["pid"], proc.info["name"] or "llama", rss))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    return procs
+
+def fmt_ram(bytes_val: int) -> str:
+    if bytes_val < 1024 ** 2:
+        return f"{bytes_val / 1024:.0f} KB"
+    elif bytes_val < 1024 ** 3:
+        return f"{bytes_val / 1024**2:.1f} MB"
+    return f"{bytes_val / 1024**3:.2f} GB"
+
+def total_ram_bytes() -> int:
+    if not HAS_PSUTIL:
+        return 1
+    try:
+        return psutil.virtual_memory().total
+    except Exception:
+        return 1
+
+_TOTAL_RAM = total_ram_bytes()  # constante, cachear una sola vez
+
 # ── Paleta ────────────────────────────────────────────────────────────────────
 IS_WIN    = platform.system() == "Windows"
 BG        = "#0e0e0f"
@@ -190,6 +224,8 @@ RED       = "#f87171"
 CYAN      = "#67e8f9"
 BORDER    = "#3f3f46"
 SEL_BG    = "#292524"
+RAM_BAR   = "#22d3ee"   # color de la barra RAM
+RAM_BG    = "#1e3a3f"   # fondo de la barra RAM
 FONT_MONO = ("Consolas", 9)  if IS_WIN else ("Menlo", 9)
 FONT_UI   = ("Segoe UI", 10) if IS_WIN else ("Helvetica Neue", 10)
 FONT_TINY = ("Segoe UI", 8)  if IS_WIN else ("Helvetica Neue", 8)
@@ -204,10 +240,18 @@ class LlamaLauncher(tk.Tk):
         self._selected_gguf  = None
         self._gguf_scan_job  = None
         self._preview_job    = None
-        self._all_gguf_files  = []   # full list for filter
-        self._help_cache      = {}   # {binary_name: [{"flag","desc"}]}
-        self._ac_popup        = None  # active autocomplete Toplevel
-        self._ac_job          = None  # after() id for debounce
+        self._all_gguf_files  = []
+        self._help_cache      = {}
+        self._ac_popup        = None
+        self._ac_job          = None
+
+        # ── Watcher state ────────────────────────────────────────────────────
+        self._last_gguf_snapshot = []   # lista de nombres para comparar
+        self._gguf_watch_job     = None
+
+        # ── RAM monitor state ────────────────────────────────────────────────
+        self._ram_job  = None
+        self._save_job = None  # debounce para save_data
 
         self.title("LlamaCPP Launcher")
         self.configure(bg=BG)
@@ -224,12 +268,17 @@ class LlamaLauncher(tk.Tk):
             self._on_select()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        # Warm in-memory cache from persisted data
         self._help_cache = {k: v for k, v in self.data.get("help_cache", {}).items()}
-        self.log("info", "Launcher started  v4")
+        self.log("info", "Launcher started  v5")
         self.log("info", f"Config: {DATA_FILE}")
         if self._help_cache:
             self.log("info", f"Flag cache: {list(self._help_cache.keys())}")
+        if not HAS_PSUTIL:
+            self.log("warn", "psutil not found — RAM monitor disabled (pip install psutil)")
+
+        # Arrancar watchers después de que la UI esté lista
+        self._start_gguf_watcher()
+        self._start_ram_monitor()
 
     # ── Estilos ───────────────────────────────────────────────────────────────
     def _apply_style(self):
@@ -305,7 +354,13 @@ class LlamaLauncher(tk.Tk):
         # Row 8: sep
         tk.Frame(self, bg=BORDER, height=1).grid(row=8, column=0, sticky="ew", padx=18)
 
-        # Row 9: Log
+        # Row 9: RAM monitor
+        self._build_ram_panel()
+
+        # Row 10: sep
+        tk.Frame(self, bg=BORDER, height=1).grid(row=10, column=0, sticky="ew", padx=18)
+
+        # Row 11: Log
         self._build_log_panel()
 
     # ── Panel: comandos ───────────────────────────────────────────────────────
@@ -320,7 +375,7 @@ class LlamaLauncher(tk.Tk):
         self.listbox = tk.Listbox(
             lf, bg=BG2, fg=FG, selectbackground=SEL_BG, selectforeground=ACCENT,
             activestyle="none", relief="flat", bd=0, font=FONT_UI,
-            highlightthickness=0, cursor="hand2")
+            highlightthickness=0, cursor="hand2", exportselection=0)
         self.listbox.grid(row=0, column=0, sticky="nsew")
         sb = tk.Scrollbar(lf, orient="vertical", command=self.listbox.yview,
                           bg=BG3, troughcolor=BG2, width=8)
@@ -377,7 +432,6 @@ class LlamaLauncher(tk.Tk):
         ttk.Label(parent, text=".GGUF MODELS", style="Cap.TLabel").grid(
             row=0, column=4, sticky="w", pady=(0, 4))
 
-        # Filtro
         filter_frame = tk.Frame(parent, bg=BG)
         filter_frame.grid(row=0, column=4, sticky="e", pady=(0, 4))
         self.gguf_filter_var = tk.StringVar()
@@ -398,16 +452,27 @@ class LlamaLauncher(tk.Tk):
         self.gguf_listbox = tk.Listbox(
             gf, bg=BG2, fg=FG, selectbackground=SEL_BG, selectforeground=ACCENT,
             activestyle="none", relief="flat", bd=0, font=FONT_MONO,
-            highlightthickness=0, cursor="hand2")
+            highlightthickness=0, cursor="hand2", exportselection=0)
         self.gguf_listbox.grid(row=0, column=0, sticky="nsew")
         sb2 = tk.Scrollbar(gf, orient="vertical", command=self.gguf_listbox.yview,
                            bg=BG3, troughcolor=BG2, width=8)
         sb2.grid(row=0, column=1, sticky="ns")
-        self.gguf_listbox.configure(yscrollcommand=sb2.set)
+        sb2h = tk.Scrollbar(gf, orient="horizontal", command=self.gguf_listbox.xview,
+                            bg=BG3, troughcolor=BG2, width=8)
+        sb2h.grid(row=1, column=0, sticky="ew")
+        self.gguf_listbox.configure(yscrollcommand=sb2.set, xscrollcommand=sb2h.set)
         self.gguf_listbox.bind("<<ListboxSelect>>", lambda e: self._on_gguf_select())
 
-        self.gguf_status = ttk.Label(parent, text="No models", style="Dim.TLabel")
-        self.gguf_status.grid(row=2, column=4, sticky="w", pady=(4, 0))
+        # Fila de status + indicador de watcher
+        status_row = tk.Frame(parent, bg=BG)
+        status_row.grid(row=2, column=4, sticky="ew", pady=(4, 0))
+
+        self.gguf_status = ttk.Label(status_row, text="No models", style="Dim.TLabel")
+        self.gguf_status.pack(side="left")
+
+        self.gguf_watch_indicator = ttk.Label(
+            status_row, text="⟳ watching", style="Dim.TLabel")
+        self.gguf_watch_indicator.pack(side="right")
 
     # ── Quick params ──────────────────────────────────────────────────────────
     def _build_params_panel(self):
@@ -417,7 +482,6 @@ class LlamaLauncher(tk.Tk):
         ttk.Label(outer, text="QUICK PARAMS", style="Cap.TLabel",
                   background=BG2).grid(row=0, column=0, sticky="w", padx=(0, 16))
 
-        # (key, flag, label, tooltip, from_, to_, inc, width)
         PARAMS = [
             ("ngl",     "-ngl",   "GPU Layers",  "Layers on GPU (0=CPU only)", 0,   512,    1,    5),
             ("ctx",     "-c",     "Context",     "Context window size",         512, 131072, 512,  7),
@@ -455,14 +519,11 @@ class LlamaLauncher(tk.Tk):
                 insertbackground=FG, relief="flat",
                 font=FONT_MONO, highlightbackground=BORDER, highlightthickness=1)
             spin.pack(anchor="w")
-            # Trace the StringVar directly — Spinbox <<Increment>>/<<Decrement>> fire
-            # BEFORE the var updates, so binding those events misses the new value.
             val_var.trace_add("write", lambda *_, k=key: self._on_param_change())
 
             ttk.Label(frame, text=tip, style="Par.TLabel",
                       background=BG2).pack(anchor="w")
 
-        # ── Reasoning dropdown ──
         rea_col = len(PARAMS) + 1
         rea_frame = tk.Frame(outer, bg=BG2)
         rea_frame.grid(row=0, column=rea_col, padx=(0, 14), sticky="w")
@@ -491,7 +552,6 @@ class LlamaLauncher(tk.Tk):
         ttk.Label(rea_frame, text="--reasoning", style="Par.TLabel",
                   background=BG2).pack(anchor="w")
 
-        # ── Help / autocomplete fetch button ──
         help_col = rea_col + 1
         help_frame = tk.Frame(outer, bg=BG2)
         help_frame.grid(row=0, column=help_col, padx=(8, 0), sticky="ne")
@@ -501,7 +561,6 @@ class LlamaLauncher(tk.Tk):
         ttk.Label(help_frame, textvariable=self.help_status_var,
                   style="Dim.TLabel").pack(anchor="w")
 
-        # Reset button
         reset_btn = ttk.Button(outer, text="Reset params", style="Sec.TButton",
                                command=self._reset_params)
         reset_btn.grid(row=0, column=help_col + 1, padx=(10, 0), sticky="e")
@@ -566,10 +625,20 @@ class LlamaLauncher(tk.Tk):
         ttk.Button(f, text="...", style="Sec.TButton", width=3,
                    command=self._browse_gguf_dir).grid(row=0, column=5, padx=(6, 0))
 
+    # ── RAM panel ─────────────────────────────────────────────────────────────
+    def _build_ram_panel(self):
+        f = ttk.Frame(self, padding=(18, 6, 18, 6))
+        f.grid(row=9, column=0, sticky="ew")
+        ttk.Label(f, text="PROCESS RAM", style="Cap.TLabel").pack(side="left", padx=(0, 14))
+        self._ram_label = tk.Label(f, text="—", bg=BG, fg=FG_DIM, font=FONT_TINY, anchor="w")
+        self._ram_label.pack(side="left")
+
+
+
     # ── Log panel ─────────────────────────────────────────────────────────────
     def _build_log_panel(self):
         lf = ttk.Frame(self, padding=(18, 6, 18, 14))
-        lf.grid(row=9, column=0, sticky="ew")
+        lf.grid(row=11, column=0, sticky="ew")
         lf.columnconfigure(0, weight=1)
 
         hdr = ttk.Frame(lf)
@@ -617,6 +686,71 @@ class LlamaLauncher(tk.Tk):
         self.log_text.configure(state="disabled")
         self.log("info", "Log cleared")
 
+    # ── GGUF directory watcher ────────────────────────────────────────────────
+    def _start_gguf_watcher(self):
+        """Arranca el polling de 3s del directorio GGUF."""
+        folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
+        self._last_gguf_snapshot = find_gguf_files(folder)
+        self._poll_gguf_dir()
+
+    def _poll_gguf_dir(self):
+        """Compara el estado actual del directorio con el snapshot anterior."""
+        try:
+            folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
+            if not folder or not os.path.isdir(folder):
+                self._gguf_watch_job = self.after(3000, self._poll_gguf_dir)
+                return
+            current = find_gguf_files(folder)
+            if current != self._last_gguf_snapshot:
+                added   = set(current) - set(self._last_gguf_snapshot)
+                removed = set(self._last_gguf_snapshot) - set(current)
+                self._last_gguf_snapshot = current
+                self._refresh_gguf_list()
+                for f in added:
+                    self.log("ok", f"GGUF added: {f}")
+                for f in removed:
+                    self.log("warn", f"GGUF removed: {f}")
+                self._flash_watch_indicator()
+        except Exception as exc:
+            print(f"[gguf watcher error] {exc}")
+        self._gguf_watch_job = self.after(3000, self._poll_gguf_dir)
+
+    def _flash_watch_indicator(self):
+        """Breve destello en el indicador '⟳ watching' al detectar cambios."""
+        try:
+            self.gguf_watch_indicator.config(foreground=GREEN)
+            self.after(800, lambda: self.gguf_watch_indicator.config(foreground=FG_DIM))
+        except Exception:
+            pass
+
+    # ── RAM monitor ───────────────────────────────────────────────────────────
+    def _start_ram_monitor(self):
+        self._ram_job = self.after(2000, self._poll_ram)
+
+    def _poll_ram(self):
+        try:
+            if not HAS_PSUTIL:
+                self._ram_label.config(text="pip install psutil to enable", fg=FG_DIM)
+            else:
+                own_pid = os.getpid()
+                cur_bin = os.path.splitext(self._get_current_binary().lower())[0]
+
+                # Si hay binario conocido: filtrar por nombre directamente (sin cmdline scan)
+                procs = [p for p in get_llama_processes(name_filter=cur_bin) if p[0] != own_pid]
+
+                if cur_bin and not procs:
+                    self._ram_label.config(text=f"'{cur_bin}' not running", fg=FG_DIM)
+                elif procs:
+                    total = _TOTAL_RAM or 1
+                    parts = [f"[{pid}] {name}  {fmt_ram(rss)}  ({rss/total*100:.1f}%)"
+                             for pid, name, rss in procs]
+                    self._ram_label.config(text="  |  ".join(parts), fg=GREEN)
+                else:
+                    self._ram_label.config(text="no llama.cpp processes running", fg=FG_DIM)
+        except Exception as exc:
+            print(f"[ram poll error] {exc}")
+        self._ram_job = self.after(2000, self._poll_ram)
+
     # ── Preview ───────────────────────────────────────────────────────────────
     def _schedule_preview(self):
         if self._preview_job:
@@ -637,20 +771,15 @@ class LlamaLauncher(tk.Tk):
             print(f"[_update_preview error] {exc}")
 
     def _use_preview_as_base(self):
-        """Copy preview into base command, stripping -m so it is injected fresh at run time."""
         final = self.preview_text.get("1.0", "end").strip()
         if not final:
             self.log("warn", "Preview is empty — nothing to transfer")
             return
-        # Remove -m <path> before writing to base — model injection happens at run time
         final = re.sub(r'\s*-m\s+(?:"[^"]*"|\'[^\']*\'|\S+)', "", final).strip()
         self.cmd_text.delete("1.0", "end")
         self.cmd_text.insert("1.0", final)
-        # Disable all quick params — they are now baked into the base command
         for v in self._param_enabled.values():
             v.set(False)
-        self._selected_gguf = None
-        self.gguf_listbox.selection_clear(0, "end")
         self._on_param_change()
         self._save_command()
         self.log("ok", "Preview transferred to base command; params & model cleared")
@@ -665,8 +794,6 @@ class LlamaLauncher(tk.Tk):
             save_data(self.data)
             self._schedule_preview()
         except Exception as exc:
-            # Never let this raise — a Tkinter trace that raises is silently removed,
-            # which would permanently break the spinbox arrows.
             print(f"[_on_param_change error] {exc}")
 
     def _reset_params(self):
@@ -765,6 +892,15 @@ class LlamaLauncher(tk.Tk):
         if not base_cmd:
             self.log("err", "Run: command is empty"); return
 
+        if not self._selected_gguf:
+            if not messagebox.askyesno(
+                "No model selected",
+                "No GGUF model is selected.\nThe command will run without -m.\n\nContinue anyway?",
+                icon="warning"
+            ):
+                self.log("info", "Run cancelled — no model selected")
+                return
+
         p  = {k: v.get() for k, v in self._param_vars.items()}
         pe = {k: v.get() for k, v in self._param_enabled.items()}
         final_cmd = build_final_cmd(base_cmd, self._selected_gguf or "", p, pe)
@@ -810,6 +946,15 @@ class LlamaLauncher(tk.Tk):
             size = fmt_size(os.path.join(folder, fname)) if folder else ""
             self.gguf_listbox.insert("end", f"  {fname}  [{size}]")
 
+        # Restaurar selección visual si el modelo activo sigue visible
+        if self._selected_gguf:
+            sel_name = os.path.basename(self._selected_gguf)
+            for i, fname in enumerate(files):
+                if fname == sel_name:
+                    self.gguf_listbox.selection_set(i)
+                    self.gguf_listbox.see(i)
+                    break
+
         if files:
             self.gguf_status.config(text=f"{len(files)}/{len(self._all_gguf_files)} model(s)")
         elif folder and os.path.isdir(folder):
@@ -825,7 +970,6 @@ class LlamaLauncher(tk.Tk):
     def _on_gguf_select(self):
         sel = self.gguf_listbox.curselection()
         if not sel: return
-        # El entry tiene "  nombre.gguf  [4.2GB]" — extraer solo el nombre
         raw      = self.gguf_listbox.get(sel[0]).strip()
         filename = re.sub(r'\s*\[.*?\]\s*$', '', raw).strip()
         gguf_dir = self.gguf_dir_var.get().strip()
@@ -835,12 +979,10 @@ class LlamaLauncher(tk.Tk):
 
     # ── Autocomplete ──────────────────────────────────────────────────────────
     def _get_current_binary(self) -> str:
-        """Extract the binary name (first token) from the command textbox."""
         line = self.cmd_text.get("1.0", "end").strip().split()[0] if self.cmd_text.get("1.0", "end").strip() else ""
         return os.path.basename(line) if line else ""
 
     def _fetch_help_flags(self):
-        """Run binary --help and cache the parsed flags."""
         binary   = self._get_current_binary()
         bin_path = self.bin_var.get().strip()
         if not binary:
@@ -866,7 +1008,6 @@ class LlamaLauncher(tk.Tk):
         self._schedule_preview()
         if event.keysym in ("Up", "Down", "Return", "Escape", "Tab"):
             return
-        # Auto-load flags when a .exe binary is detected and not yet cached
         first_token = self.cmd_text.get("1.0", "end").strip().split()[0] if self.cmd_text.get("1.0", "end").strip() else ""
         binary = os.path.basename(first_token)
         if binary.lower().endswith(".exe") and binary not in self._help_cache:
@@ -874,7 +1015,6 @@ class LlamaLauncher(tk.Tk):
         self._schedule_autocomplete()
 
     def _auto_fetch_if_needed(self):
-        """Silently load flags for the current binary if not already cached."""
         first_token = self.cmd_text.get("1.0", "end").strip().split()[0] if self.cmd_text.get("1.0", "end").strip() else ""
         binary = os.path.basename(first_token)
         if binary and binary not in self._help_cache:
@@ -887,41 +1027,32 @@ class LlamaLauncher(tk.Tk):
 
     def _try_autocomplete(self):
         try:
-            # Get text from start of current line up to cursor
             cursor_pos = self.cmd_text.index("insert")
             line_start = f"{cursor_pos.split('.')[0]}.0"
             text_before = self.cmd_text.get(line_start, cursor_pos)
-
-            # Match any flag prefix: --long or -short (at least - + 1 char)
             m = re.search(r'(-{1,2}[\w][\w\-]*)$', text_before)
             if not m:
                 self._hide_autocomplete()
                 return
             prefix = m.group(1)
-            # For single-dash require at least 2 chars (e.g. "-t"), double-dash at least 3
             min_len = 2 if prefix.startswith('--') else 2
             if len(prefix) < min_len:
                 self._hide_autocomplete()
                 return
-
             binary = self._get_current_binary()
-            # Load from memory cache first, then persisted cache
             flags = self._help_cache.get(binary) or self.data.get("help_cache", {}).get(binary, [])
             if not flags:
                 self._hide_autocomplete()
                 return
-
             matches = [f for f in flags if f["flag"].startswith(prefix)]
             if not matches:
                 self._hide_autocomplete()
                 return
-
             self._show_autocomplete(matches, prefix)
         except Exception as exc:
             print(f"[autocomplete error] {exc}")
 
     def _show_autocomplete(self, matches: list, prefix: str):
-        """Two-pane popup: flag list on the left, full description on the right."""
         try:
             bbox = self.cmd_text.bbox("insert")
             if not bbox:
@@ -934,7 +1065,6 @@ class LlamaLauncher(tk.Tk):
         MAX_VISIBLE = 12
         visible = matches[:MAX_VISIBLE]
 
-        # ── (Re)create popup window ──
         if self._ac_popup and self._ac_popup.winfo_exists():
             pop = self._ac_popup
             pop.geometry(f"+{x_root}+{y_root}")
@@ -948,11 +1078,9 @@ class LlamaLauncher(tk.Tk):
         for w in pop.winfo_children():
             w.destroy()
 
-        # ── Two-pane frame ──
         container = tk.Frame(pop, bg=BG2)
         container.pack(fill="both", expand=True, padx=1, pady=1)
 
-        # Left: flag list
         list_frame = tk.Frame(container, bg=BG2)
         list_frame.pack(side="left", fill="y")
 
@@ -967,13 +1095,10 @@ class LlamaLauncher(tk.Tk):
 
         for item in visible:
             lb.insert("end", f"  {item['flag']}")
-
         lb.selection_set(0)
 
-        # Divider
         tk.Frame(container, bg=BORDER, width=1).pack(side="left", fill="y", padx=4)
 
-        # Right: description text
         desc_frame = tk.Frame(container, bg=BG2)
         desc_frame.pack(side="left", fill="both", expand=True)
 
@@ -995,7 +1120,6 @@ class LlamaLauncher(tk.Tk):
 
         update_desc(0)
 
-        # Footer: more results hint
         if len(matches) > MAX_VISIBLE:
             footer = tk.Frame(pop, bg=BG3)
             footer.pack(fill="x", padx=1, pady=(0, 1))
@@ -1022,7 +1146,6 @@ class LlamaLauncher(tk.Tk):
         lb.bind("<Escape>",           lambda e: (self._hide_autocomplete(), self.cmd_text.focus_set()))
         lb.bind("<FocusOut>",         lambda e: self.after(120, self._maybe_hide_popup))
 
-        # Arrow-key navigation from cmd_text
         def cmd_text_arrow(event):
             if not (self._ac_popup and self._ac_popup.winfo_exists()):
                 return
@@ -1046,12 +1169,10 @@ class LlamaLauncher(tk.Tk):
         self.cmd_text.bind("<Tab>",    cmd_text_arrow, add="+")
 
     def _insert_autocomplete(self, flag: str, prefix: str):
-        """Replace the partial --prefix with the chosen flag in the textbox."""
         cursor_pos  = self.cmd_text.index("insert")
         line_no     = cursor_pos.split(".")[0]
         line_start  = f"{line_no}.0"
         line_text   = self.cmd_text.get(line_start, cursor_pos)
-        # Find start of the prefix in this line
         start_char  = len(line_text) - len(prefix)
         delete_from = f"{line_no}.{start_char}"
         self.cmd_text.delete(delete_from, cursor_pos)
@@ -1059,7 +1180,6 @@ class LlamaLauncher(tk.Tk):
         self._schedule_preview()
 
     def _maybe_hide_popup(self):
-        """Hide popup only if neither the popup nor cmd_text has focus."""
         try:
             focused = self.focus_get()
             if self._ac_popup and self._ac_popup.winfo_exists():
@@ -1075,19 +1195,19 @@ class LlamaLauncher(tk.Tk):
             except Exception:
                 pass
             self._ac_popup = None
-        # Unbind transient arrow overrides
         for seq in ("<Down>", "<Up>", "<Return>"):
             try:
                 self.cmd_text.unbind(seq)
             except Exception:
                 pass
-        # Re-bind preview trigger
         self.cmd_text.bind("<KeyRelease>", self._on_cmd_keyrelease)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _autosave(self, key, var):
         self.data[key] = var.get().strip()
-        save_data(self.data)
+        if self._save_job:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(800, lambda: save_data(self.data))
 
     def _browse_bin(self):
         path = filedialog.askdirectory(title="llama.cpp binaries folder")
@@ -1103,6 +1223,11 @@ class LlamaLauncher(tk.Tk):
             self.log("info", f"Models: {path}")
 
     def _on_close(self):
+        # Cancelar watchers antes de cerrar
+        if self._gguf_watch_job:
+            self.after_cancel(self._gguf_watch_job)
+        if self._ram_job:
+            self.after_cancel(self._ram_job)
         self._save_command()
         self.destroy()
 
