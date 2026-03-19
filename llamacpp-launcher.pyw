@@ -87,8 +87,24 @@ def inject_model_arg(cmd: str, gguf_full_path: str) -> str:
         return re.sub(pattern, lambda _: repl, cmd)
     return cmd.rstrip() + f' -m "{gguf_full_path}"'
 
+def join_continuation_lines(cmd: str) -> str:
+    """Collapse a multi-line command (with or without \\ continuations) into one line.
+
+    Handles:
+      llama-cli.exe \\
+      -c 1024 \\
+      --mlock
+    as well as plain multi-line text (newlines treated as spaces).
+    """
+    # Replace backslash-newline (with optional surrounding whitespace) with a space
+    joined = re.sub(r'\\\s*\n\s*', ' ', cmd)
+    # Replace any remaining bare newlines with spaces
+    joined = joined.replace('\n', ' ')
+    # Normalise whitespace
+    return ' '.join(joined.split())
+
 def build_final_cmd(base_cmd: str, gguf_path: str, params: dict, params_enabled: dict) -> str:
-    cmd = base_cmd
+    cmd = join_continuation_lines(base_cmd)   # ← normalise multi-line input first
     if gguf_path:
         cmd = inject_model_arg(cmd, gguf_path)
     flag_map = {"ngl": "-ngl", "ctx": "-c", "temp": "--temp", "threads": "-t", "n": "-n"}
@@ -120,8 +136,6 @@ def parse_help_flags(bin_path: str, binary: str) -> list:
 
     flags = []
     seen  = set()
-    # Pattern: flag(s) column  followed by 2+ spaces  followed by description
-    # Group 1: flags+optional-arg  Group 2: description text
     line_pat = re.compile(
         r'^\s{0,10}'
         r'(--?[\w][\w-]*(?:[\s,]+--?[\w][\w-]*)*(?:\s+\S{1,20})?)'
@@ -244,7 +258,7 @@ class LlamaLauncher(tk.Tk):
 
         self._last_gguf_snapshot = []
         self._gguf_watch_job     = None
-        self._gguf_size_cache    = {}   # fname -> "X.XGB"
+        self._gguf_size_cache    = {}
         self._ram_job  = None
         self._save_job = None
 
@@ -390,20 +404,36 @@ class LlamaLauncher(tk.Tk):
 
         ttk.Label(editor, text="Base command", style="Sub.TLabel").grid(
             row=2, column=0, sticky="w", pady=(0, 3))
+        cmd_box = tk.Frame(editor, bg=BG3,
+                           highlightbackground=BORDER, highlightthickness=1)
+        cmd_box.grid(row=3, column=0, sticky="nsew", pady=(0, 4), padx=1)
+        cmd_box.columnconfigure(0, weight=1)
+        cmd_box.rowconfigure(0, weight=1)
+
         self.cmd_text = tk.Text(
-            editor, bg=BG3, fg=FG, insertbackground=FG,
-            relief="flat", bd=0, font=FONT_MONO, wrap="word", undo=True,
-            highlightbackground=BORDER, highlightthickness=1, padx=8, pady=8)
-        self.cmd_text.grid(row=3, column=0, sticky="nsew", pady=(0, 10), padx=1)
+            cmd_box, bg=BG3, fg=FG, insertbackground=FG,
+            relief="flat", bd=0, font=FONT_MONO, wrap="none", undo=True,
+            highlightbackground=BORDER, highlightthickness=0, padx=8, pady=8)
+        self.cmd_text.grid(row=0, column=0, sticky="nsew")
+
+        cmd_ysb = tk.Scrollbar(cmd_box, orient="vertical", command=self.cmd_text.yview,
+                               bg=BG3, troughcolor=BG2, width=8)
+        cmd_ysb.grid(row=0, column=1, sticky="ns")
+
+        cmd_xsb = tk.Scrollbar(cmd_box, orient="horizontal", command=self.cmd_text.xview,
+                               bg=BG3, troughcolor=BG2, width=6)
+        cmd_xsb.grid(row=1, column=0, sticky="ew")
+
+        self.cmd_text.configure(yscrollcommand=cmd_ysb.set, xscrollcommand=cmd_xsb.set)
+
         self.cmd_text.bind("<KeyRelease>",  self._on_cmd_keyrelease)
         self.cmd_text.bind("<FocusOut>",    lambda e: self._hide_autocomplete())
         self.cmd_text.bind("<Escape>",      lambda e: self._hide_autocomplete())
 
         eb = ttk.Frame(editor, style="Card.TFrame")
-        eb.grid(row=4, column=0, sticky="ew")
+        eb.grid(row=5, column=0, sticky="ew")
         ttk.Button(eb, text="Save", style="Sec.TButton",
                    command=self._save_command).pack(side="left", padx=(0, 8))
-        # ── Acción: Launch / Relaunch / Kill (de derecha a izquierda con pack right) ──
         ttk.Button(eb, text="▶ Launch",   style="OrgBtn.TButton",
                    command=self._run_command).pack(side="right", padx=(4, 0))
         ttk.Button(eb, text="⟳ Relaunch", style="OrgBtn.TButton",
@@ -638,9 +668,8 @@ class LlamaLauncher(tk.Tk):
             height=5, wrap="none",
             highlightthickness=0, padx=10, pady=6,
             cursor="arrow")
-        # Block user edits without using state="disabled" (avoids flicker on every log call)
         self.log_text.bind("<Key>", lambda e: "break")
-        self.log_text.bind("<Button-2>", lambda e: "break")  # middle-click paste
+        self.log_text.bind("<Button-2>", lambda e: "break")
         self.log_text.grid(row=0, column=0, sticky="ew")
 
         lsb = tk.Scrollbar(log_box, orient="horizontal", command=self.log_text.xview,
@@ -674,7 +703,6 @@ class LlamaLauncher(tk.Tk):
         self._poll_gguf_dir()
 
     def _poll_gguf_dir(self):
-        """Lanza el scan del directorio en un thread; la UI se actualiza vía after(0)."""
         folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
         if not folder or not os.path.isdir(folder):
             self._gguf_watch_job = self.after(3000, self._poll_gguf_dir)
@@ -694,7 +722,6 @@ class LlamaLauncher(tk.Tk):
         self._gguf_watch_job = self.after(3000, self._poll_gguf_dir)
 
     def _on_gguf_poll_result(self, current: list, snapshot: list, folder: str):
-        """Callback en hilo principal con el resultado del scan de directorio."""
         if current != snapshot:
             added   = set(current) - set(snapshot)
             removed = set(snapshot) - set(current)
@@ -718,7 +745,6 @@ class LlamaLauncher(tk.Tk):
         self._ram_job = self.after(2000, self._poll_ram)
 
     def _poll_ram(self):
-        """Lanza la consulta psutil en un thread; actualiza el label vía after(0)."""
         if not HAS_PSUTIL:
             self._ram_label.config(text="pip install psutil to enable", fg=FG_DIM)
             self._ram_job = self.after(2000, self._poll_ram)
@@ -738,7 +764,6 @@ class LlamaLauncher(tk.Tk):
         self._ram_job = self.after(2000, self._poll_ram)
 
     def _on_ram_poll_result(self, cur_bin: str, procs: list):
-        """Callback en hilo principal con el resultado de la consulta de procesos."""
         try:
             if cur_bin and not procs:
                 new_text = f"'{cur_bin}' not running"
@@ -752,7 +777,6 @@ class LlamaLauncher(tk.Tk):
             else:
                 new_text = "no llama.cpp processes running"
                 new_fg   = FG_DIM
-            # Only redraw if something actually changed
             if new_text != getattr(self, "_last_ram_text", None) or new_fg != getattr(self, "_last_ram_fg", None):
                 self._last_ram_text = new_text
                 self._last_ram_fg   = new_fg
@@ -772,7 +796,6 @@ class LlamaLauncher(tk.Tk):
             p     = {k: v.get() for k, v in self._param_vars.items()}
             pe    = {k: v.get() for k, v in self._param_enabled.items()}
             final = build_final_cmd(base, self._selected_gguf or "", p, pe)
-            # Skip the state-cycling redraw if nothing changed (avoids flicker)
             current = self.preview_text.get("1.0", "end-1c")
             if final == current:
                 return
@@ -784,18 +807,53 @@ class LlamaLauncher(tk.Tk):
             print(f"[_update_preview error] {exc}")
 
     def _use_preview_as_base(self):
+        import shlex
+
         final = self.preview_text.get("1.0", "end").strip()
         if not final:
             self.log("warn", "Preview is empty — nothing to transfer")
             return
+
+        # Detect whether the user's current base command uses \ continuations
+        current_base = self.cmd_text.get("1.0", "end")
+        is_multiline  = bool(re.search(r"\\\s*\n", current_base))
+
+        # Strip the injected -m "..." so the model stays a selection, not hardcoded
         final = re.sub(r'\s*-m\s+(?:"[^"]*"|\'[^\']*\'|\S+)', "", final).strip()
+
+        if is_multiline:
+            # Re-format as flag-per-line with \ continuations
+            try:
+                tokens = shlex.split(final)
+            except ValueError:
+                tokens = final.split()
+
+            def _quote_if_needed(s: str) -> str:
+                return f'"{s}"' if (' ' in s or not s) else s
+
+            lines = []
+            i = 0
+            while i < len(tokens):
+                tok = tokens[i]
+                if tok.startswith("-") and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                    lines.append(f"{tok} {_quote_if_needed(tokens[i + 1])}")
+                    i += 2
+                else:
+                    lines.append(tok)
+                    i += 1
+            result = " \\\n".join(lines)
+            self.log("ok", "Preview → base command (multi-line \\); params & model cleared")
+        else:
+            # Keep as single line, just normalise spaces
+            result = " ".join(final.split())
+            self.log("ok", "Preview → base command (single line); params & model cleared")
+
         self.cmd_text.delete("1.0", "end")
-        self.cmd_text.insert("1.0", final)
+        self.cmd_text.insert("1.0", result)
         for v in self._param_enabled.values():
             v.set(False)
         self._on_param_change()
         self._save_command()
-        self.log("ok", "Preview transferred to base command; params & model cleared")
 
     # ── Params ────────────────────────────────────────────────────────────────
     def _on_param_change(self):
@@ -804,7 +862,7 @@ class LlamaLauncher(tk.Tk):
                 self.data["params"][k] = v.get()
             for k, v in self._param_enabled.items():
                 self.data["params_enabled"][k] = v.get()
-            self._schedule_save()       # debounced — no I/O síncrono por tecla
+            self._schedule_save()
             self._schedule_preview()
         except Exception as exc:
             print(f"[_on_param_change error] {exc}")
@@ -943,25 +1001,17 @@ class LlamaLauncher(tk.Tk):
             self.log("err", f"Error: {e}")
 
     # ── Kill / Relaunch ───────────────────────────────────────────────────────
-    # Nombres de procesos que son terminales / shells; su muerte cierra la ventana
     _TERMINAL_NAMES = frozenset({
-        # Windows
         "cmd.exe", "cmd", "powershell.exe", "powershell", "windowsterminal.exe",
         "conhost.exe",
-        # Linux
         "bash", "sh", "zsh", "fish",
         "gnome-terminal-server", "gnome-terminal",
         "konsole", "xfce4-terminal", "xterm", "lxterminal", "alacritty",
         "kitty", "tilix",
-        # macOS
         "terminal", "iterm2", "login",
     })
 
     def _kill_processes(self) -> list:
-        """
-        Mata el/los procesos del binario actual MÁS su terminal padre.
-        Devuelve lista de strings descriptivos de lo que se mató.
-        """
         if not HAS_PSUTIL:
             self.log("err", "Kill requires psutil (pip install psutil)")
             return []
@@ -985,7 +1035,6 @@ class LlamaLauncher(tk.Tk):
             try:
                 proc = psutil.Process(pid)
 
-                # Capturar el proceso padre ANTES de matar el hijo
                 terminal_proc = None
                 try:
                     parent = proc.parent()
@@ -994,7 +1043,6 @@ class LlamaLauncher(tk.Tk):
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
 
-                # Matar proceso llama
                 proc.terminate()
                 try:
                     proc.wait(timeout=3)
@@ -1003,7 +1051,6 @@ class LlamaLauncher(tk.Tk):
                 killed.append(f"[{pid}] {name}")
                 self.log("warn", f"Killed: [{pid}] {name}")
 
-                # Matar la ventana terminal padre
                 if terminal_proc:
                     try:
                         terminal_proc.terminate()
@@ -1018,22 +1065,19 @@ class LlamaLauncher(tk.Tk):
         return killed
 
     def _kill_only(self):
-        """Botón Kill: mata proceso + terminal, sin relanzar."""
         killed = self._kill_processes()
         if not killed:
             self.log("info", "Kill: nothing to kill")
 
     def _relaunch(self):
-        """Botón Relaunch: mata proceso + terminal, luego relanza."""
         killed = self._kill_processes()
-        delay  = 700 if killed else 0   # pausa solo si hubo algo que matar (liberar VRAM)
+        delay  = 700 if killed else 0
         self.after(delay, self._run_command)
 
     # ── Lógica: GGUF ──────────────────────────────────────────────────────────
     def _refresh_gguf_list(self):
         folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else self.data["gguf_path"]
         self._all_gguf_files = find_gguf_files(folder)
-        # Cachear tamaños una sola vez para no hacer getsize en cada keypress del filtro
         self._gguf_size_cache = {}
         if folder:
             for fname in self._all_gguf_files:
@@ -1052,7 +1096,6 @@ class LlamaLauncher(tk.Tk):
         files = [f for f in self._all_gguf_files if q in f.lower()] if q else self._all_gguf_files
         size_cache = getattr(self, "_gguf_size_cache", {})
 
-        # Build the new item list and only redraw if it actually changed
         new_items = [f"  {fname}  [{size_cache.get(fname, '')}]" for fname in files]
         current_items = list(self.gguf_listbox.get(0, "end"))
         if new_items != current_items:
@@ -1092,11 +1135,14 @@ class LlamaLauncher(tk.Tk):
 
     # ── Autocomplete ──────────────────────────────────────────────────────────
     def _get_current_binary(self) -> str:
-        line = self.cmd_text.get("1.0", "end").strip().split()[0] if self.cmd_text.get("1.0", "end").strip() else ""
-        return os.path.basename(line) if line else ""
+        raw = self.cmd_text.get("1.0", "end").strip()
+        if not raw:
+            return ""
+        # split() handles \n and \ tokens — first real token is the binary
+        tokens = [t for t in raw.split() if t != "\\"]
+        return os.path.basename(tokens[0]) if tokens else ""
 
     def _fetch_help_flags(self):
-        """Lanza parse_help_flags en un hilo para no bloquear la UI."""
         binary   = self._get_current_binary()
         bin_path = self.bin_var.get().strip()
         if not binary:
@@ -1109,14 +1155,11 @@ class LlamaLauncher(tk.Tk):
 
         def _worker():
             flags = parse_help_flags(bin_path, binary)
-            # Actualizar UI desde el hilo principal
             self.after(0, lambda: self._on_flags_loaded(binary, flags))
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_flags_loaded(self, binary: str, flags: list):
-        """Callback en el hilo principal tras cargar los flags."""
         if flags:
             self._help_cache[binary] = flags
             self.data["help_cache"][binary] = flags
@@ -1132,15 +1175,14 @@ class LlamaLauncher(tk.Tk):
         self._schedule_preview()
         if event.keysym in ("Up", "Down", "Return", "Escape", "Tab"):
             return
-        first_token = self.cmd_text.get("1.0", "end").strip().split()[0] if self.cmd_text.get("1.0", "end").strip() else ""
-        binary = os.path.basename(first_token)
+        first_token = self._get_current_binary()
+        binary = first_token
         if binary.lower().endswith(".exe") and binary not in self._help_cache:
             self.after(300, self._auto_fetch_if_needed)
         self._schedule_autocomplete()
 
     def _auto_fetch_if_needed(self):
-        first_token = self.cmd_text.get("1.0", "end").strip().split()[0] if self.cmd_text.get("1.0", "end").strip() else ""
-        binary = os.path.basename(first_token)
+        binary = self._get_current_binary()
         if binary and binary not in self._help_cache:
             self._fetch_help_flags()
 
@@ -1328,7 +1370,6 @@ class LlamaLauncher(tk.Tk):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _schedule_save(self):
-        """Debounce: escribe a disco 800ms después del último cambio."""
         if self._save_job:
             self.after_cancel(self._save_job)
         self._save_job = self.after(800, lambda: threading.Thread(

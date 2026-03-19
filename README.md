@@ -6,11 +6,12 @@ Just specify the binaries path and models path, then create commands, choose the
 
 ## Features
 
-- Simple and intuitive interface  
-- Interactive command composition  
-- Compose, save, and run llama.cpp commands  
-- Automatic extraction and parsing of `--help` output for argument suggestions and autocomplete  
-- Process memory monitoring
+- Simple and intuitive interface.
+- Interactive command composition.
+- Compose, save, and run llama.cpp commands.
+- Automatic extraction and parsing of `--help` output for argument suggestions and autocomplete.
+- Process memory monitoring.
+- Multiline command args ( '\' ).
 
 ![](./img/screen1.png)
 
