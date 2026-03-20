@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import json, os, re, subprocess, platform, threading
+import json, os, re, subprocess, platform, threading, queue
 from datetime import datetime
 
 try:
@@ -88,23 +88,13 @@ def inject_model_arg(cmd: str, gguf_full_path: str) -> str:
     return cmd.rstrip() + f' -m "{gguf_full_path}"'
 
 def join_continuation_lines(cmd: str) -> str:
-    """Collapse a multi-line command (with or without \\ continuations) into one line.
-
-    Handles:
-      llama-cli.exe \\
-      -c 1024 \\
-      --mlock
-    as well as plain multi-line text (newlines treated as spaces).
-    """
-    # Replace backslash-newline (with optional surrounding whitespace) with a space
+    """Collapse a multi-line command (with or without \\ continuations) into one line."""
     joined = re.sub(r'\\\s*\n\s*', ' ', cmd)
-    # Replace any remaining bare newlines with spaces
     joined = joined.replace('\n', ' ')
-    # Normalise whitespace
     return ' '.join(joined.split())
 
 def build_final_cmd(base_cmd: str, gguf_path: str, params: dict, params_enabled: dict) -> str:
-    cmd = join_continuation_lines(base_cmd)   # ← normalise multi-line input first
+    cmd = join_continuation_lines(base_cmd)
     if gguf_path:
         cmd = inject_model_arg(cmd, gguf_path)
     flag_map = {"ngl": "-ngl", "ctx": "-c", "temp": "--temp", "threads": "-t", "n": "-n"}
@@ -257,10 +247,27 @@ class LlamaLauncher(tk.Tk):
         self._ac_job          = None
 
         self._last_gguf_snapshot = []
-        self._gguf_watch_job     = None
         self._gguf_size_cache    = {}
-        self._ram_job  = None
         self._save_job = None
+
+        # ── Single unified background-poll loop (replaces two independent after() chains) ──
+        # Threads post results here; one after() timer drains the queue each tick.
+        self._bg_queue            = queue.Queue()
+        self._bg_poll_job         = None   # single after() handle for the whole loop
+        self._bg_tick             = 0      # monotonic counter incremented each tick
+        self._RAM_TICKS           = 2      # poll RAM every N ticks  (N * _BG_INTERVAL ms)
+        self._GGUF_TICKS          = 3      # poll GGUF every N ticks
+        self._BG_INTERVAL         = 2000   # ms between ticks → RAM @4s, GGUF @6s
+        self._ram_worker_running  = False  # prevent overlapping RAM threads
+        self._gguf_worker_running = False  # prevent overlapping GGUF threads
+
+        # ── Autocomplete state (avoids closure accumulation) ──────────────
+        self._ac_visible      = []   # items currently shown in popup
+        self._ac_prefix       = ""   # prefix being completed
+        self._ac_bind_ids     = {}   # {seq: funcid} for precise unbinding
+
+        # ── Preview cache (avoids redundant widget reads/writes) ──────────
+        self._last_preview_text = None
 
         self.title("LlamaCPP Launcher")
         self.configure(bg=BG)
@@ -277,6 +284,16 @@ class LlamaLauncher(tk.Tk):
             self._on_select()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # ── Restore-from-minimize repaint fix ────────────────────────────────
+        # <Map> fires when the WM makes the window visible again (deiconify).
+        # Tk treats this as a system event — NOT an idle task — so
+        # update_idletasks() alone is skipped and the window stays black until
+        # the next natural event. We force a full repaint via after(1,...) to
+        # stay out of the event handler's call stack (avoids re-entrancy).
+        self._was_minimized = False
+        self.bind("<Unmap>",    self._on_unmap)
+        self.bind("<Map>",      self._on_map_restore)
         self._help_cache = {k: v for k, v in self.data.get("help_cache", {}).items()}
         self.log("info", "Launcher started  v5")
         self.log("info", f"Config: {DATA_FILE}")
@@ -285,8 +302,30 @@ class LlamaLauncher(tk.Tk):
         if not HAS_PSUTIL:
             self.log("warn", "psutil not found — RAM monitor disabled (pip install psutil)")
 
-        self._start_gguf_watcher()
-        self._start_ram_monitor()
+        self._start_background_poll()
+
+    # ── Restore-from-minimize repaint ─────────────────────────────────────────
+    def _on_unmap(self, event):
+        """Track when the root window is iconified (minimized)."""
+        if event.widget is self:
+            self._was_minimized = True
+
+    def _on_map_restore(self, event):
+        """Force a full repaint when the window is restored from minimized state.
+
+        <Map> fires for every widget as the window opens; the `is self` guard
+        limits the repaint trigger to the root window only.  after(1,...) keeps
+        us off the handler's call stack to avoid Tk re-entrancy.
+        """
+        if event.widget is self and self._was_minimized:
+            self._was_minimized = False
+            self.after(1, self._force_repaint)
+
+    def _force_repaint(self):
+        """Two-pass repaint: geometry first, then expose all widgets."""
+        self.update_idletasks()          # flush pending layout/geometry passes
+        self.event_generate("<Expose>")  # tell Tk to repaint exposed areas
+        self.update_idletasks()          # process the expose events immediately
 
     # ── Estilos ───────────────────────────────────────────────────────────────
     def _apply_style(self):
@@ -592,12 +631,17 @@ class LlamaLauncher(tk.Tk):
         preview_box.grid(row=0, column=1, sticky="ew")
         preview_box.columnconfigure(0, weight=1)
 
+        # Keep state=normal always; block editing via key binding instead of
+        # toggling state on every update (saves 2 configure() calls per preview).
         self.preview_text = tk.Text(
             preview_box, bg=BG2, fg=CYAN,
             relief="flat", bd=0, font=FONT_MONO,
-            height=2, wrap="none", state="disabled",
+            height=2, wrap="none",
             highlightthickness=0, padx=10, pady=6)
         self.preview_text.grid(row=0, column=0, sticky="ew")
+        self.preview_text.bind("<Key>",      lambda e: "break")
+        self.preview_text.bind("<Button-2>", lambda e: "break")
+        self.preview_text.bind("<Button-3>", lambda e: "break")
 
         prev_sb = tk.Scrollbar(preview_box, orient="horizontal",
                                command=self.preview_text.xview,
@@ -685,43 +729,122 @@ class LlamaLauncher(tk.Tk):
         self.log_text.tag_configure("cmd",  foreground=ACCENT)
 
     # ── Logging ───────────────────────────────────────────────────────────────
+    _LOG_MAX_LINES = 300   # cap keeps the Text widget lean; older entries are trimmed
+
     def log(self, level: str, msg: str):
         ts     = datetime.now().strftime("%H:%M:%S")
         prefix = {"info": "·", "ok": "✓", "warn": "!", "err": "✗", "cmd": "▶"}.get(level, "·")
         self.log_text.insert("end", f"[{ts}] ", "ts")
         self.log_text.insert("end", f"{prefix} {msg}\n", level)
+        # Trim oldest lines when the widget exceeds the cap.
+        # float(index("end")) gives line_count.char — cheap way to count lines.
+        line_count = int(float(self.log_text.index("end"))) - 1
+        if line_count > self._LOG_MAX_LINES:
+            excess = line_count - self._LOG_MAX_LINES
+            self.log_text.delete("1.0", f"{excess + 1}.0")
         self.log_text.see("end")
 
     def _clear_log(self):
         self.log_text.delete("1.0", "end")
         self.log("info", "Log cleared")
 
-    # ── GGUF directory watcher ────────────────────────────────────────────────
-    def _start_gguf_watcher(self):
+    # ── Unified background poll loop ──────────────────────────────────────────
+    # One after() chain drives both RAM and GGUF checks on separate sub-tick
+    # cadences.  Worker threads post results to self._bg_queue; the main-thread
+    # drain call processes ALL pending results in a single pass, so at most one
+    # round of widget updates happens per tick regardless of how many threads
+    # returned simultaneously.
+    #
+    # Intervals at default _BG_INTERVAL=2000 ms, _RAM_TICKS=2, _GGUF_TICKS=3:
+    #   RAM  checked every 4 s  (was 2 s — two after() chains each 2 s)
+    #   GGUF checked every 6 s  (was 3 s — separate after() chain)
+    #   after() fires: 1×/2 s instead of 2×/2 s + 1×/3 s = fewer wakeups
+
+    def _start_background_poll(self):
+        # Seed the initial GGUF snapshot without spawning a thread (it's fast)
         folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
         self._last_gguf_snapshot = find_gguf_files(folder)
-        self._poll_gguf_dir()
+        self._bg_tick    = 0
+        self._bg_poll_job = self.after(self._BG_INTERVAL, self._bg_poll_tick)
 
-    def _poll_gguf_dir(self):
-        folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
-        if not folder or not os.path.isdir(folder):
-            self._gguf_watch_job = self.after(3000, self._poll_gguf_dir)
-            return
+    def _bg_poll_tick(self):
+        """Main-thread tick: drain the result queue, then optionally start new workers."""
+        # 1. Drain all pending thread results in one batch (no extra after(0,...) wakeups)
+        try:
+            while True:
+                kind, payload = self._bg_queue.get_nowait()
+                if kind == "ram":
+                    self._apply_ram_result(*payload)
+                elif kind == "gguf":
+                    self._apply_gguf_result(*payload)
+        except queue.Empty:
+            pass
 
-        snapshot = list(self._last_gguf_snapshot)
+        self._bg_tick += 1
 
-        def _worker():
-            try:
-                current = find_gguf_files(folder)
-            except Exception as exc:
-                print(f"[gguf watcher error] {exc}")
-                current = snapshot
-            self.after(0, lambda: self._on_gguf_poll_result(current, snapshot, folder))
+        # 2. Launch RAM worker if due and not already running
+        if self._bg_tick % self._RAM_TICKS == 0 and not self._ram_worker_running:
+            if not HAS_PSUTIL:
+                self._ram_label.config(text="pip install psutil to enable", fg=FG_DIM)
+            else:
+                own_pid = os.getpid()
+                cur_bin = os.path.splitext(self._get_current_binary().lower())[0]
+                self._ram_worker_running = True
 
-        threading.Thread(target=_worker, daemon=True).start()
-        self._gguf_watch_job = self.after(3000, self._poll_gguf_dir)
+                def _ram_worker(cur_bin=cur_bin, own_pid=own_pid):
+                    try:
+                        procs = [p for p in get_llama_processes(name_filter=cur_bin)
+                                 if p[0] != own_pid]
+                    except Exception:
+                        procs = []
+                    self._bg_queue.put(("ram", (cur_bin, procs)))
+                    self._ram_worker_running = False
 
-    def _on_gguf_poll_result(self, current: list, snapshot: list, folder: str):
+                threading.Thread(target=_ram_worker, daemon=True).start()
+
+        # 3. Launch GGUF worker if due and not already running
+        if self._bg_tick % self._GGUF_TICKS == 0 and not self._gguf_worker_running:
+            folder = self.gguf_dir_var.get().strip() if hasattr(self, "gguf_dir_var") else ""
+            if folder and os.path.isdir(folder):
+                snapshot = list(self._last_gguf_snapshot)
+                self._gguf_worker_running = True
+
+                def _gguf_worker(folder=folder, snapshot=snapshot):
+                    try:
+                        current = find_gguf_files(folder)
+                    except Exception:
+                        current = snapshot
+                    self._bg_queue.put(("gguf", (current, snapshot, folder)))
+                    self._gguf_worker_running = False
+
+                threading.Thread(target=_gguf_worker, daemon=True).start()
+
+        # 4. Schedule the next tick (single after() call)
+        self._bg_poll_job = self.after(self._BG_INTERVAL, self._bg_poll_tick)
+
+    def _apply_ram_result(self, cur_bin: str, procs: list):
+        try:
+            if cur_bin and not procs:
+                new_text = f"'{cur_bin}' not running"
+                new_fg   = FG_DIM
+            elif procs:
+                total = _TOTAL_RAM or 1
+                parts = [f"[{pid}] {name}  {fmt_ram(rss)}  ({rss/total*100:.1f}%)"
+                         for pid, name, rss in procs]
+                new_text = "  |  ".join(parts)
+                new_fg   = GREEN
+            else:
+                new_text = "no llama.cpp processes running"
+                new_fg   = FG_DIM
+            if (new_text != getattr(self, "_last_ram_text", None)
+                    or new_fg != getattr(self, "_last_ram_fg", None)):
+                self._last_ram_text = new_text
+                self._last_ram_fg   = new_fg
+                self._ram_label.config(text=new_text, fg=new_fg)
+        except Exception as exc:
+            print(f"[ram poll error] {exc}")
+
+    def _apply_gguf_result(self, current: list, snapshot: list, folder: str):
         if current != snapshot:
             added   = set(current) - set(snapshot)
             removed = set(snapshot) - set(current)
@@ -740,50 +863,6 @@ class LlamaLauncher(tk.Tk):
         except Exception:
             pass
 
-    # ── RAM monitor ───────────────────────────────────────────────────────────
-    def _start_ram_monitor(self):
-        self._ram_job = self.after(2000, self._poll_ram)
-
-    def _poll_ram(self):
-        if not HAS_PSUTIL:
-            self._ram_label.config(text="pip install psutil to enable", fg=FG_DIM)
-            self._ram_job = self.after(2000, self._poll_ram)
-            return
-
-        own_pid = os.getpid()
-        cur_bin = os.path.splitext(self._get_current_binary().lower())[0]
-
-        def _worker():
-            try:
-                procs = [p for p in get_llama_processes(name_filter=cur_bin) if p[0] != own_pid]
-            except Exception:
-                procs = []
-            self.after(0, lambda: self._on_ram_poll_result(cur_bin, procs))
-
-        threading.Thread(target=_worker, daemon=True).start()
-        self._ram_job = self.after(2000, self._poll_ram)
-
-    def _on_ram_poll_result(self, cur_bin: str, procs: list):
-        try:
-            if cur_bin and not procs:
-                new_text = f"'{cur_bin}' not running"
-                new_fg   = FG_DIM
-            elif procs:
-                total = _TOTAL_RAM or 1
-                parts = [f"[{pid}] {name}  {fmt_ram(rss)}  ({rss/total*100:.1f}%)"
-                         for pid, name, rss in procs]
-                new_text = "  |  ".join(parts)
-                new_fg   = GREEN
-            else:
-                new_text = "no llama.cpp processes running"
-                new_fg   = FG_DIM
-            if new_text != getattr(self, "_last_ram_text", None) or new_fg != getattr(self, "_last_ram_fg", None):
-                self._last_ram_text = new_text
-                self._last_ram_fg   = new_fg
-                self._ram_label.config(text=new_text, fg=new_fg)
-        except Exception as exc:
-            print(f"[ram poll error] {exc}")
-
     # ── Preview ───────────────────────────────────────────────────────────────
     def _schedule_preview(self):
         if self._preview_job:
@@ -796,13 +875,12 @@ class LlamaLauncher(tk.Tk):
             p     = {k: v.get() for k, v in self._param_vars.items()}
             pe    = {k: v.get() for k, v in self._param_enabled.items()}
             final = build_final_cmd(base, self._selected_gguf or "", p, pe)
-            current = self.preview_text.get("1.0", "end-1c")
-            if final == current:
+            # Compare against cached value instead of reading back from the widget
+            if final == self._last_preview_text:
                 return
-            self.preview_text.configure(state="normal")
+            self._last_preview_text = final
             self.preview_text.delete("1.0", "end")
             self.preview_text.insert("1.0", final)
-            self.preview_text.configure(state="disabled")
         except Exception as exc:
             print(f"[_update_preview error] {exc}")
 
@@ -814,15 +892,12 @@ class LlamaLauncher(tk.Tk):
             self.log("warn", "Preview is empty — nothing to transfer")
             return
 
-        # Detect whether the user's current base command uses \ continuations
         current_base = self.cmd_text.get("1.0", "end")
         is_multiline  = bool(re.search(r"\\\s*\n", current_base))
 
-        # Strip the injected -m "..." so the model stays a selection, not hardcoded
         final = re.sub(r'\s*-m\s+(?:"[^"]*"|\'[^\']*\'|\S+)', "", final).strip()
 
         if is_multiline:
-            # Re-format as flag-per-line with \ continuations
             try:
                 tokens = shlex.split(final)
             except ValueError:
@@ -844,7 +919,6 @@ class LlamaLauncher(tk.Tk):
             result = " \\\n".join(lines)
             self.log("ok", "Preview → base command (multi-line \\); params & model cleared")
         else:
-            # Keep as single line, just normalise spaces
             result = " ".join(final.split())
             self.log("ok", "Preview → base command (single line); params & model cleared")
 
@@ -1138,7 +1212,6 @@ class LlamaLauncher(tk.Tk):
         raw = self.cmd_text.get("1.0", "end").strip()
         if not raw:
             return ""
-        # split() handles \n and \ tokens — first real token is the binary
         tokens = [t for t in raw.split() if t != "\\"]
         return os.path.basename(tokens[0]) if tokens else ""
 
@@ -1218,6 +1291,29 @@ class LlamaLauncher(tk.Tk):
         except Exception as exc:
             print(f"[autocomplete error] {exc}")
 
+    # ── Autocomplete helpers (instance methods avoid closure accumulation) ────
+
+    def _ac_do_select(self):
+        """Confirm the highlighted autocomplete suggestion."""
+        if not (self._ac_popup and self._ac_popup.winfo_exists()):
+            return
+        lb = getattr(self._ac_popup, "_ac_lb", None)
+        if lb is None:
+            return
+        sel = lb.curselection()
+        if sel and sel[0] < len(self._ac_visible):
+            self._insert_autocomplete(self._ac_visible[sel[0]]["flag"], self._ac_prefix)
+        self._hide_autocomplete()
+
+    def _ac_update_desc(self, idx: int):
+        """Refresh the description pane without toggling widget state."""
+        if not (self._ac_popup and self._ac_popup.winfo_exists()):
+            return
+        desc = getattr(self._ac_popup, "_ac_desc", None)
+        if desc is not None and idx < len(self._ac_visible):
+            desc.delete("1.0", "end")
+            desc.insert("1.0", self._ac_visible[idx]["desc"])
+
     def _show_autocomplete(self, matches: list, prefix: str):
         try:
             bbox = self.cmd_text.bbox("insert")
@@ -1231,18 +1327,37 @@ class LlamaLauncher(tk.Tk):
         MAX_VISIBLE = 12
         visible = matches[:MAX_VISIBLE]
 
-        if self._ac_popup and self._ac_popup.winfo_exists():
+        # Update shared state used by the instance-method callbacks
+        self._ac_visible = visible
+        self._ac_prefix  = prefix
+
+        # ── Reuse existing popup: only update content, skip widget rebuild ──
+        if (self._ac_popup and self._ac_popup.winfo_exists()
+                and hasattr(self._ac_popup, "_ac_lb")):
             pop = self._ac_popup
             pop.geometry(f"+{x_root}+{y_root}")
-        else:
-            pop = tk.Toplevel(self)
-            pop.wm_overrideredirect(True)
-            pop.configure(bg=BORDER)
-            pop.geometry(f"+{x_root}+{y_root}")
-            self._ac_popup = pop
+            lb = pop._ac_lb
+            lb.delete(0, "end")
+            for item in visible:
+                lb.insert("end", f"  {item['flag']}")
+            lb.config(height=len(visible))
+            lb.selection_set(0)
+            pop._ac_desc.config(height=len(visible))
+            self._ac_update_desc(0)
+            if len(matches) > MAX_VISIBLE:
+                pop._ac_footer_lbl.config(
+                    text=f"  ↑↓ navigate  ·  {len(matches) - MAX_VISIBLE} more matches")
+                pop._ac_footer_frm.pack(fill="x", padx=1, pady=(0, 1))
+            else:
+                pop._ac_footer_frm.pack_forget()
+            return
 
-        for w in pop.winfo_children():
-            w.destroy()
+        # ── First time: build popup from scratch ─────────────────────────────
+        pop = tk.Toplevel(self)
+        pop.wm_overrideredirect(True)
+        pop.configure(bg=BORDER)
+        pop.geometry(f"+{x_root}+{y_root}")
+        self._ac_popup = pop
 
         container = tk.Frame(pop, bg=BG2)
         container.pack(fill="both", expand=True, padx=1, pady=1)
@@ -1268,71 +1383,71 @@ class LlamaLauncher(tk.Tk):
         desc_frame = tk.Frame(container, bg=BG2)
         desc_frame.pack(side="left", fill="both", expand=True)
 
+        # Keep desc_text state=normal; block editing via key binding to avoid
+        # configure(state) calls on every selection change.
         desc_text = tk.Text(
             desc_frame,
             bg=BG2, fg=FG2, relief="flat", bd=0,
             font=FONT_TINY, wrap="word",
             width=52, height=len(visible),
             highlightthickness=0, padx=8, pady=4,
-            state="disabled", cursor="arrow"
+            cursor="arrow"
         )
+        desc_text.bind("<Key>", lambda e: "break")
         desc_text.pack(fill="both", expand=True, pady=4)
 
-        def update_desc(idx: int):
-            desc_text.configure(state="normal")
-            desc_text.delete("1.0", "end")
-            desc_text.insert("1.0", visible[idx]["desc"])
-            desc_text.configure(state="disabled")
+        footer_frm = tk.Frame(pop, bg=BG3)
+        footer_lbl = tk.Label(footer_frm, bg=BG3, fg=FG_DIM, font=FONT_TINY, anchor="w")
+        footer_lbl.pack(fill="x", padx=4, pady=2)
 
-        update_desc(0)
+        # Attach widgets as attributes so we can reuse them next call
+        pop._ac_lb         = lb
+        pop._ac_desc       = desc_text
+        pop._ac_footer_frm = footer_frm
+        pop._ac_footer_lbl = footer_lbl
+
+        self._ac_update_desc(0)
 
         if len(matches) > MAX_VISIBLE:
-            footer = tk.Frame(pop, bg=BG3)
-            footer.pack(fill="x", padx=1, pady=(0, 1))
-            tk.Label(footer,
-                     text=f"  ↑↓ navigate  ·  {len(matches) - MAX_VISIBLE} more matches",
-                     bg=BG3, fg=FG_DIM, font=FONT_TINY,
-                     anchor="w").pack(fill="x", padx=4, pady=2)
+            footer_lbl.config(
+                text=f"  ↑↓ navigate  ·  {len(matches) - MAX_VISIBLE} more matches")
+            footer_frm.pack(fill="x", padx=1, pady=(0, 1))
 
-        def on_select(event=None):
-            sel = lb.curselection()
-            if not sel:
-                return
-            self._insert_autocomplete(visible[sel[0]]["flag"], prefix)
-            self._hide_autocomplete()
+        lb.bind("<<ListboxSelect>>",
+                lambda e: self._ac_update_desc(lb.curselection()[0])
+                if lb.curselection() else None)
+        lb.bind("<Double-Button-1>", lambda e: self._ac_do_select())
+        lb.bind("<Return>",          lambda e: self._ac_do_select())
+        lb.bind("<Escape>",
+                lambda e: (self._hide_autocomplete(), self.cmd_text.focus_set()))
+        lb.bind("<FocusOut>",
+                lambda e: self.after(120, self._maybe_hide_popup))
 
-        def on_lb_select(event=None):
-            sel = lb.curselection()
-            if sel:
-                update_desc(sel[0])
-
-        lb.bind("<<ListboxSelect>>",  on_lb_select)
-        lb.bind("<Double-Button-1>",  on_select)
-        lb.bind("<Return>",           lambda e: on_select())
-        lb.bind("<Escape>",           lambda e: (self._hide_autocomplete(), self.cmd_text.focus_set()))
-        lb.bind("<FocusOut>",         lambda e: self.after(120, self._maybe_hide_popup))
-
-        def cmd_text_arrow(event):
+        def _cmd_arrow(event):
             if not (self._ac_popup and self._ac_popup.winfo_exists()):
                 return
             cur = lb.curselection()
             idx = cur[0] if cur else 0
             if event.keysym == "Down":
-                idx = min(idx + 1, len(visible) - 1)
+                idx = min(idx + 1, len(self._ac_visible) - 1)
             elif event.keysym == "Up":
                 idx = max(idx - 1, 0)
             elif event.keysym in ("Return", "Tab"):
-                on_select(); return "break"
+                self._ac_do_select()
+                return "break"
             lb.selection_clear(0, "end")
             lb.selection_set(idx)
             lb.see(idx)
-            update_desc(idx)
+            self._ac_update_desc(idx)
             return "break"
 
-        self.cmd_text.bind("<Down>",   cmd_text_arrow, add="+")
-        self.cmd_text.bind("<Up>",     cmd_text_arrow, add="+")
-        self.cmd_text.bind("<Return>", cmd_text_arrow, add="+")
-        self.cmd_text.bind("<Tab>",    cmd_text_arrow, add="+")
+        # Store funcids so _hide_autocomplete can unbind precisely (no collateral damage)
+        self._ac_bind_ids = {
+            "<Down>":   self.cmd_text.bind("<Down>",   _cmd_arrow, add="+"),
+            "<Up>":     self.cmd_text.bind("<Up>",     _cmd_arrow, add="+"),
+            "<Return>": self.cmd_text.bind("<Return>", _cmd_arrow, add="+"),
+            "<Tab>":    self.cmd_text.bind("<Tab>",    _cmd_arrow, add="+"),
+        }
 
     def _insert_autocomplete(self, flag: str, prefix: str):
         cursor_pos  = self.cmd_text.index("insert")
@@ -1361,12 +1476,17 @@ class LlamaLauncher(tk.Tk):
             except Exception:
                 pass
             self._ac_popup = None
-        for seq in ("<Down>", "<Up>", "<Return>"):
+        # Unbind precisely by funcid — prevents stomping on unrelated bindings
+        # and fixes the Tab-accumulation bug from the original code.
+        for seq, funcid in self._ac_bind_ids.items():
             try:
-                self.cmd_text.unbind(seq)
+                self.cmd_text.unbind(seq, funcid)
             except Exception:
-                pass
-        self.cmd_text.bind("<KeyRelease>", self._on_cmd_keyrelease)
+                try:
+                    self.cmd_text.unbind(seq)
+                except Exception:
+                    pass
+        self._ac_bind_ids = {}
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _schedule_save(self):
@@ -1393,10 +1513,8 @@ class LlamaLauncher(tk.Tk):
             self.log("info", f"Models: {path}")
 
     def _on_close(self):
-        if self._gguf_watch_job:
-            self.after_cancel(self._gguf_watch_job)
-        if self._ram_job:
-            self.after_cancel(self._ram_job)
+        if self._bg_poll_job:
+            self.after_cancel(self._bg_poll_job)
         self._save_command()
         self.destroy()
 
