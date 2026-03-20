@@ -16,6 +16,7 @@ DEFAULT_DATA = {
     "params": {"ngl": "", "ctx": "", "temp": "", "threads": "", "n": "", "reasoning": "auto"},
     "params_enabled": {"ngl": False, "ctx": False, "temp": False, "threads": False, "n": False, "reasoning": False},
     "help_cache": {},
+    "collapsed": {"params": False, "preview": False, "paths": False},
 }
 
 def load_data():
@@ -384,16 +385,84 @@ class LlamaLauncher(tk.Tk):
         tk.Frame(body, bg=BORDER, width=1).grid(row=0, column=3, rowspan=3, sticky="ns", padx=12)
         self._build_gguf_panel(body)
 
-        tk.Frame(self, bg=BORDER, height=1).grid(row=2, column=0, sticky="ew", padx=18)
-        self._build_params_panel()
-        tk.Frame(self, bg=BORDER, height=1).grid(row=4, column=0, sticky="ew", padx=18)
-        self._build_preview_panel()
-        tk.Frame(self, bg=BORDER, height=1).grid(row=6, column=0, sticky="ew", padx=18)
-        self._build_footer()
-        tk.Frame(self, bg=BORDER, height=1).grid(row=8, column=0, sticky="ew", padx=18)
+        # Collapsible sections: header bar at even rows, content at odd rows
+        # row 2/3: QUICK PARAMS  |  row 4/5: PREVIEW  |  row 6/7: PATHS
+        self._section_headers = {}   # key → (bar_frame, arrow_var)
+        self._section_frames  = {}   # key → content frame
+
+        self._build_section_header(row=2,  key="params",  label="QUICK PARAMS")
+        self._build_params_panel(row=3)
+        self._build_section_header(row=4,  key="preview", label="PREVIEW")
+        self._build_preview_panel(row=5)
+        self._build_section_header(row=6,  key="paths",   label="PATHS")
+        self._build_footer(row=7)
+
+        tk.Frame(self, bg=BORDER, height=1).grid(row=8,  column=0, sticky="ew", padx=18)
         self._build_ram_panel()
         tk.Frame(self, bg=BORDER, height=1).grid(row=10, column=0, sticky="ew", padx=18)
         self._build_log_panel()
+
+        # Restore persisted collapsed state
+        for key in ("params", "preview", "paths"):
+            if self.data.get("collapsed", {}).get(key, False):
+                self._apply_collapsed(key, collapsed=True, animate=False)
+
+    def _build_section_header(self, row: int, key: str, label: str):
+        """Thin clickable bar — acts as separator and section toggle."""
+        bar = tk.Frame(self, bg=BG3, cursor="hand2")
+        bar.grid(row=row, column=0, sticky="ew")
+        bar.columnconfigure(1, weight=1)
+
+        arrow_var = tk.StringVar(value="▾")
+        arrow_lbl = tk.Label(bar, textvariable=arrow_var,
+                             bg=BG3, fg=ACCENT2,
+                             font=(FONT_UI[0], 9) if IS_WIN else (FONT_UI[0], 10),
+                             padx=10, pady=2, cursor="hand2")
+        arrow_lbl.grid(row=0, column=0, sticky="w")
+
+        tk.Label(bar, text=label, bg=BG3, fg=FG2,
+                 font=(FONT_UI[0], 8, "bold") if IS_WIN else (FONT_UI[0], 9, "bold"),
+                 pady=2).grid(row=0, column=1, sticky="w")
+
+        def _enter(e):
+            bar.config(bg=BORDER)
+            arrow_lbl.config(bg=BORDER)
+        def _leave(e):
+            bar.config(bg=BG3)
+            arrow_lbl.config(bg=BG3)
+        for w in (bar, arrow_lbl):
+            w.bind("<Enter>",    _enter)
+            w.bind("<Leave>",    _leave)
+            w.bind("<Button-1>", lambda e, k=key: self._toggle_section(k))
+        # Also bind all child labels created above
+        for child in bar.winfo_children():
+            child.bind("<Enter>",    _enter)
+            child.bind("<Leave>",    _leave)
+            child.bind("<Button-1>", lambda e, k=key: self._toggle_section(k))
+
+        self._section_headers[key] = (bar, arrow_var)
+
+    def _toggle_section(self, key: str):
+        """Flip the collapsed state of a section and persist it."""
+        current = self.data.setdefault("collapsed", {}).get(key, False)
+        self._apply_collapsed(key, collapsed=not current, animate=True)
+        self.data["collapsed"][key] = not current
+        self._schedule_save()
+
+    def _apply_collapsed(self, key: str, collapsed: bool, animate: bool = True):
+        """Show or hide the content frame for a section; update the arrow."""
+        frame = self._section_frames.get(key)
+        _, arrow_var = self._section_headers.get(key, (None, None))
+        if frame is None or arrow_var is None:
+            return
+        if collapsed:
+            frame.grid_remove()
+            arrow_var.set("▸")
+        else:
+            frame.grid()
+            arrow_var.set("▾")
+        if animate:
+            self.update_idletasks()
 
     # ── Panel: comandos ───────────────────────────────────────────────────────
     def _build_commands_panel(self, parent):
@@ -527,12 +596,10 @@ class LlamaLauncher(tk.Tk):
         self.gguf_watch_indicator.pack(side="right")
 
     # ── Quick params ──────────────────────────────────────────────────────────
-    def _build_params_panel(self):
+    def _build_params_panel(self, row: int = 3):
         outer = ttk.Frame(self, style="Params.TFrame", padding=(18, 8, 18, 8))
-        outer.grid(row=3, column=0, sticky="ew")
-
-        ttk.Label(outer, text="QUICK PARAMS", style="Cap.TLabel",
-                  background=BG2).grid(row=0, column=0, sticky="w", padx=(0, 16))
+        outer.grid(row=row, column=0, sticky="ew")
+        self._section_frames["params"] = outer
 
         PARAMS = [
             ("ngl",     "-ngl",   "GPU Layers",  "Layers on GPU (0=CPU only)", 0,   512,    1,    5),
@@ -619,16 +686,14 @@ class LlamaLauncher(tk.Tk):
         outer.columnconfigure(help_col + 1, weight=1)
 
     # ── Preview ───────────────────────────────────────────────────────────────
-    def _build_preview_panel(self):
+    def _build_preview_panel(self, row: int = 5):
         pf = ttk.Frame(self, padding=(18, 6, 18, 6))
-        pf.grid(row=5, column=0, sticky="ew")
-        pf.columnconfigure(1, weight=1)
-
-        ttk.Label(pf, text="PREVIEW", style="Cap.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 10))
+        pf.grid(row=row, column=0, sticky="ew")
+        pf.columnconfigure(0, weight=1)
+        self._section_frames["preview"] = pf
 
         preview_box = tk.Frame(pf, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
-        preview_box.grid(row=0, column=1, sticky="ew")
+        preview_box.grid(row=0, column=0, sticky="ew")
         preview_box.columnconfigure(0, weight=1)
 
         # Keep state=normal always; block editing via key binding instead of
@@ -650,12 +715,13 @@ class LlamaLauncher(tk.Tk):
         self.preview_text.configure(xscrollcommand=prev_sb.set)
 
         ttk.Button(pf, text="↑ Use as base", style="Sec.TButton",
-                   command=self._use_preview_as_base).grid(row=0, column=2, padx=(10, 0))
+                   command=self._use_preview_as_base).grid(row=0, column=1, padx=(10, 0))
 
     # ── Footer: paths ─────────────────────────────────────────────────────────
-    def _build_footer(self):
+    def _build_footer(self, row: int = 7):
         f = ttk.Frame(self, padding=(18, 10, 18, 8))
-        f.grid(row=7, column=0, sticky="ew")
+        f.grid(row=row, column=0, sticky="ew")
+        self._section_frames["paths"] = f
         f.columnconfigure(1, weight=1)
         f.columnconfigure(4, weight=1)
 
