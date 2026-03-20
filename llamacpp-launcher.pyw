@@ -17,6 +17,7 @@ DEFAULT_DATA = {
     "params_enabled": {"ngl": False, "ctx": False, "temp": False, "threads": False, "n": False, "reasoning": False},
     "help_cache": {},
     "collapsed": {"params": False, "preview": False, "paths": False},
+    "vim_mode": False,
 }
 
 def load_data():
@@ -233,6 +234,336 @@ FONT_UI   = ("Segoe UI", 10) if IS_WIN else ("Helvetica Neue", 10)
 FONT_TINY = ("Segoe UI", 8)  if IS_WIN else ("Helvetica Neue", 8)
 FONT_LOG  = ("Consolas", 9)  if IS_WIN else ("Menlo", 9)
 
+
+# ── Vim-like modal editor ──────────────────────────────────────────────────────
+# Wraps a tk.Text widget and adds Normal / Insert modes.
+# Normal mode: hjkl navigation, w/b word jumps, 0/$ line start/end,
+#              gg/G doc start/end, x delete char, dd delete line,
+#              i/a/A/o/O enter Insert, u undo, Ctrl+R redo.
+# Insert mode: Escape → back to Normal.
+#
+# The widget background dims in Normal mode to give a clear visual cue.
+
+class VimEditor:
+    """Modal vim-like editor for a tk.Text widget.
+
+    Binding strategy
+    ----------------
+    * <Escape>  bound explicitly with add="+" — handles Insert→Normal cleanly
+                regardless of what other <Escape> bindings exist on the widget.
+    * <KeyPress> bound with add="+" — handles all Normal-mode commands and
+                swallows unwanted keystrokes.
+
+    Keeping Escape in its own binding (not caught inside <KeyPress>) is the
+    key fix: Tk resolves specific patterns (<Escape>) and generic patterns
+    (<KeyPress>) as separate binding entries.  Both fire for the same physical
+    key press; whichever was registered first runs first.  By owning the
+    <Escape> binding explicitly we guarantee it always fires and we always
+    return "break" to prevent the character from being inserted.
+    """
+
+    INSERT_BG = BG3
+    NORMAL_BG = "#16161a"
+
+    def __init__(self, text_widget):
+        self.w          = text_widget
+        self._mode      = "insert"
+        self._enabled   = False
+        self._g_pending = False
+        self._d_pending = False
+        self._esc_id    = None   # funcid for <Escape> binding
+        self._key_id    = None   # funcid for <KeyPress> binding
+
+        self.mode_var = tk.StringVar(value="")
+
+        # Block-cursor tag (orange block on char under cursor in Normal mode)
+        self.w.tag_configure("vim_cursor", background=ACCENT, foreground=BG)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def enable(self):
+        if self._enabled:
+            return
+        self._enabled = True
+        # Bind Escape explicitly — more reliable than catching it in <KeyPress>
+        self._esc_id = self.w.bind("<Escape>",  self._on_escape,  add="+")
+        self._key_id = self.w.bind("<KeyPress>", self._on_key,    add="+")
+        self._set_mode("normal")
+
+    def disable(self):
+        if not self._enabled:
+            return
+        self._enabled = False
+        for attr, seq in (("_esc_id", "<Escape>"), ("_key_id", "<KeyPress>")):
+            fid = getattr(self, attr)
+            if fid:
+                try:
+                    self.w.unbind(seq, fid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.w.tag_remove("vim_cursor", "1.0", "end")
+        self.w.config(bg=self.INSERT_BG, insertwidth=2,
+                      insertbackground=FG)
+        self._mode = "insert"
+        self.mode_var.set("")
+
+    def is_enabled(self):
+        return self._enabled
+
+    @property
+    def mode(self):
+        return self._mode
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _set_mode(self, mode):
+        self._mode      = mode
+        self._g_pending = False
+        self._d_pending = False
+        if mode == "normal":
+            # Hide the blinking line cursor; block tag shows position instead
+            self.w.config(bg=self.NORMAL_BG, insertwidth=2,
+                          insertbackground=self.NORMAL_BG)
+            self._draw_block_cursor()
+            self.mode_var.set("NORMAL")
+        else:
+            self.w.tag_remove("vim_cursor", "1.0", "end")
+            self.w.config(bg=self.INSERT_BG, insertwidth=2,
+                          insertbackground=FG)
+            self.mode_var.set("INSERT")
+
+    def _draw_block_cursor(self):
+        self.w.tag_remove("vim_cursor", "1.0", "end")
+        if self._mode == "normal":
+            self.w.tag_add("vim_cursor", "insert", "insert +1c")
+
+    # ── Escape handler (bound separately, fires reliably) ─────────────────────
+
+    def _on_escape(self, event):
+        if not self._enabled:
+            return
+        if self._mode == "insert":
+            # Step back one column (vim: cursor ends on the last typed char)
+            row, col = self.w.index("insert").split(".")
+            if int(col) > 0:
+                self.w.mark_set("insert", f"{row}.{int(col)-1}")
+            self._set_mode("normal")
+        else:
+            # Normal mode: cancel any pending multi-key sequence
+            self._g_pending = False
+            self._d_pending = False
+            self._draw_block_cursor()
+        return "break"   # prevent default Text class Escape handling
+
+    # ── KeyPress handler (Normal-mode commands only) ──────────────────────────
+
+    def _on_key(self, event):
+        if not self._enabled:
+            return
+        # Insert mode: pass every key through — Escape is handled by _on_escape
+        if self._mode == "insert":
+            return
+
+        # Normal mode — swallow everything, act on known keys
+        keysym = event.keysym
+        char   = event.char
+
+        # ── Multi-key sequences ──────────────────────────────────────────────
+        if self._g_pending:
+            self._g_pending = False
+            if char == "g":
+                self.w.mark_set("insert", "1.0")
+                self.w.see("insert")
+            self._draw_block_cursor()
+            return "break"
+
+        if self._d_pending:
+            self._d_pending = False
+            if char == "d":
+                row = self.w.index("insert").split(".")[0]
+                self.w.delete(f"{row}.0", f"{row}.end")
+            elif char == "w":
+                self._delete_word()
+            self._draw_block_cursor()
+            return "break"
+
+        # ── Movement ────────────────────────────────────────────────────────
+        if   char == "h" or keysym == "Left":
+            self.w.mark_set("insert", "insert -1c")
+        elif char == "l" or keysym == "Right":
+            self.w.mark_set("insert", "insert +1c")
+        elif char == "k" or keysym == "Up":
+            self._move_vertical(-1)
+        elif char == "j" or keysym == "Down":
+            self._move_vertical(1)
+        elif char == "w":
+            self._word_jump(forward=True)
+        elif char == "b":
+            self._word_jump(forward=False)
+        elif char == "0":
+            row = self.w.index("insert").split(".")[0]
+            self.w.mark_set("insert", f"{row}.0")
+        elif char == "$":
+            row = self.w.index("insert").split(".")[0]
+            self.w.mark_set("insert", f"{row}.end")
+        elif char == "g":
+            self._g_pending = True
+            self._draw_block_cursor()
+            return "break"
+        elif char == "G":
+            self.w.mark_set("insert", "end -1c")
+        elif char == "e":
+            self._word_end()
+
+        # ── Editing ─────────────────────────────────────────────────────────
+        elif char == "x":
+            self.w.delete("insert", "insert +1c")
+        elif char == "d":
+            self._d_pending = True
+            return "break"
+        elif char == "u":
+            try:    self.w.edit_undo()
+            except Exception: pass
+        elif keysym == "r" and (event.state & 0x4):
+            try:    self.w.edit_redo()
+            except Exception: pass
+
+        # ── Enter Insert mode ────────────────────────────────────────────────
+        elif char == "i":
+            self._set_mode("insert")
+            return "break"
+        elif char == "a":
+            self.w.mark_set("insert", "insert +1c")
+            self._set_mode("insert")
+            return "break"
+        elif char == "A":
+            row = self.w.index("insert").split(".")[0]
+            self.w.mark_set("insert", f"{row}.end")
+            self._set_mode("insert")
+            return "break"
+        elif char == "o":
+            row = self.w.index("insert").split(".")[0]
+            self.w.mark_set("insert", f"{row}.end")
+            self.w.insert("insert", "\n")
+            self._set_mode("insert")
+            return "break"
+        elif char == "O":
+            row = self.w.index("insert").split(".")[0]
+            self.w.mark_set("insert", f"{row}.0")
+            self.w.insert("insert", "\n")
+            self.w.mark_set("insert", f"{row}.0")
+            self._set_mode("insert")
+            return "break"
+
+        self.w.see("insert")
+        self._draw_block_cursor()
+        return "break"   # swallow all keys in Normal mode
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _move_vertical(self, delta):
+        row, col = map(int, self.w.index("insert").split("."))
+        new_row  = max(1, row + delta)
+        line_len = int(self.w.index(f"{new_row}.end").split(".")[1])
+        new_col  = min(col, max(0, line_len - 1)) if line_len else 0
+        self.w.mark_set("insert", f"{new_row}.{new_col}")
+
+    # ── Word helpers (Python-side, handles - as separator) ──────────────────
+
+    @staticmethod
+    def _is_word_char(ch):
+        """Word chars: alphanumerics + underscore.  Everything else (-, /, space…) is a boundary."""
+        return ch.isalnum() or ch == '_'
+
+    def _text_offset(self, index):
+        """Convert a Tk index string to a linear char offset in the full text."""
+        text = self.w.get("1.0", "end-1c")
+        row, col = map(int, self.w.index(index).split("."))
+        lines = text.split("\n")
+        offset = sum(len(lines[i]) + 1 for i in range(row - 1)) + col
+        return text, offset
+
+    def _offset_to_index(self, text, offset):
+        """Convert a linear offset back to a Tk row.col index string."""
+        offset = max(0, min(offset, len(text)))
+        lines = text.split("\n")
+        row = 1
+        for line in lines:
+            line_len = len(line) + 1   # +1 for the newline
+            if offset < line_len:
+                return f"{row}.{offset}"
+            offset -= line_len
+            row += 1
+        return f"{row}.0"
+
+    def _word_jump(self, forward=True):
+        """Move to start of next (w) or previous (b) word.
+        Words are sequences of [a-zA-Z0-9_]; - / space etc. are separators.
+        This matches llama.cpp flag style: --ctx-size has four words.
+        """
+        text, pos = self._text_offset("insert")
+        length = len(text)
+
+        if forward:
+            # Skip current word chars
+            i = pos
+            while i < length and self._is_word_char(text[i]):
+                i += 1
+            # Skip non-word chars (separators / whitespace)
+            while i < length and not self._is_word_char(text[i]):
+                i += 1
+            i = min(i, length - 1) if length else 0
+        else:
+            # Step back one to get off current position
+            i = max(pos - 1, 0)
+            # Skip non-word chars going left
+            while i > 0 and not self._is_word_char(text[i]):
+                i -= 1
+            # Skip word chars going left to find start
+            while i > 0 and self._is_word_char(text[i - 1]):
+                i -= 1
+
+        self.w.mark_set("insert", self._offset_to_index(text, i))
+        self.w.see("insert")
+
+    def _word_end(self):
+        """e: move to end of current/next word (last char, vim-style)."""
+        text, pos = self._text_offset("insert")
+        length = len(text)
+        i = pos + 1   # skip at least one char
+        # Skip separators
+        while i < length and not self._is_word_char(text[i]):
+            i += 1
+        # Move to last char of the word
+        while i + 1 < length and self._is_word_char(text[i + 1]):
+            i += 1
+        i = min(i, length - 1) if length else 0
+        self.w.mark_set("insert", self._offset_to_index(text, i))
+        self.w.see("insert")
+
+    def _delete_word(self):
+        """dw: delete from cursor to start of next word (like vim dw)."""
+        text, start = self._text_offset("insert")
+        length = len(text)
+        i = start
+        # If on a word char: delete through end of word
+        if i < length and self._is_word_char(text[i]):
+            while i < length and self._is_word_char(text[i]):
+                i += 1
+            # Also consume trailing separators (not newlines)
+            while i < length and not self._is_word_char(text[i]) and text[i] != "\n":
+                i += 1
+        else:
+            # On a separator: delete separators up to next word
+            while i < length and not self._is_word_char(text[i]) and text[i] != "\n":
+                i += 1
+        start_idx = self._offset_to_index(text, start)
+        end_idx   = self._offset_to_index(text, i)
+        if start_idx != end_idx:
+            self.w.delete(start_idx, end_idx)
+
+
 # ── App ────────────────────────────────────────────────────────────────────────
 class LlamaLauncher(tk.Tk):
     def __init__(self):
@@ -269,6 +600,9 @@ class LlamaLauncher(tk.Tk):
 
         # ── Preview cache (avoids redundant widget reads/writes) ──────────
         self._last_preview_text = None
+
+        # ── Vim editor (created after _build_ui sets up cmd_text) ────────────
+        self._vim = None  # type: VimEditor
 
         self.title("LlamaCPP Launcher")
         self.configure(bg=BG)
@@ -536,10 +870,28 @@ class LlamaLauncher(tk.Tk):
 
         self.cmd_text.bind("<KeyRelease>",  self._on_cmd_keyrelease)
         self.cmd_text.bind("<FocusOut>",    lambda e: self._hide_autocomplete())
-        self.cmd_text.bind("<Escape>",      lambda e: self._hide_autocomplete())
+        # Escape: handled by VimEditor when vim mode is on; fallback hides autocomplete
+        self.cmd_text.bind("<Escape>", self._on_editor_escape)
 
+        # ── Bottom toolbar: mode indicator + vim toggle + action buttons ─────
         eb = ttk.Frame(editor, style="Card.TFrame")
         eb.grid(row=5, column=0, sticky="ew")
+
+        # Vim mode indicator (only visible when vim is active)
+        self._vim_mode_label = tk.Label(
+            eb, text="", bg=BG2, fg=ACCENT, width=8,
+            font=(FONT_MONO[0], FONT_MONO[1], "bold"))
+        self._vim_mode_label.pack(side="left", padx=(0, 6))
+
+        # Vim toggle switch
+        self._vim_var = tk.BooleanVar(value=self.data.get("vim_mode", False))
+        vim_cb = tk.Checkbutton(
+            eb, text="vim", variable=self._vim_var,
+            bg=BG2, fg=FG2, activebackground=BG2, activeforeground=FG,
+            selectcolor=BG3, font=FONT_TINY, cursor="hand2",
+            command=self._on_vim_toggle)
+        vim_cb.pack(side="left", padx=(0, 8))
+
         ttk.Button(eb, text="Save", style="Sec.TButton",
                    command=self._save_command).pack(side="left", padx=(0, 8))
         ttk.Button(eb, text="▶ Launch",   style="OrgBtn.TButton",
@@ -548,6 +900,44 @@ class LlamaLauncher(tk.Tk):
                    command=self._relaunch).pack(side="right", padx=(4, 0))
         ttk.Button(eb, text="✕ Kill",     style="KillBtn.TButton",
                    command=self._kill_only).pack(side="right", padx=(4, 0))
+
+        # Initialise vim editor now that cmd_text exists
+        self._vim = VimEditor(self.cmd_text)
+        self._vim.mode_var.trace_add("write", self._on_vim_mode_changed)
+        if self.data.get("vim_mode", False):
+            self._vim.enable()
+
+    # ── Vim mode helpers ─────────────────────────────────────────────────────
+    def _on_editor_escape(self, event):
+        """Escape in cmd_text: always hide autocomplete popup.
+        VimEditor's own <KeyPress add=+> handler manages mode transitions
+        independently — both handlers fire, which is intentional."""
+        self._hide_autocomplete()
+
+    def _on_vim_toggle(self):
+        if not self._vim:
+            return
+        enabled = self._vim_var.get()
+        if enabled:
+            self._vim.enable()
+        else:
+            self._vim.disable()
+        self.data["vim_mode"] = enabled
+        self._schedule_save()
+        self.log("info", f"Vim mode {'enabled' if enabled else 'disabled'}")
+
+    def _on_vim_mode_changed(self, *_):
+        """Update the mode badge label when VimEditor changes modes."""
+        if not self._vim or not self._vim.is_enabled():
+            self._vim_mode_label.config(text="")
+            return
+        mode = self._vim.mode_var.get()
+        if mode == "NORMAL":
+            self._vim_mode_label.config(text="NORMAL", fg=ACCENT)
+        elif mode == "INSERT":
+            self._vim_mode_label.config(text="INSERT", fg=GREEN)
+        else:
+            self._vim_mode_label.config(text="")
 
     # ── Panel: GGUF ───────────────────────────────────────────────────────────
     def _build_gguf_panel(self, parent):
@@ -1312,6 +1702,9 @@ class LlamaLauncher(tk.Tk):
 
     def _on_cmd_keyrelease(self, event):
         self._schedule_preview()
+        # In vim Normal mode no text is being typed — skip autocomplete
+        if self._vim and self._vim.is_enabled() and self._vim.mode == "normal":
+            return
         if event.keysym in ("Up", "Down", "Return", "Escape", "Tab"):
             return
         first_token = self._get_current_binary()
