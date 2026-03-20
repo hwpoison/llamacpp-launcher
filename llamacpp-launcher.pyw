@@ -877,23 +877,25 @@ class LlamaLauncher(tk.Tk):
         eb = ttk.Frame(editor, style="Card.TFrame")
         eb.grid(row=5, column=0, sticky="ew")
 
+
+        ttk.Button(eb, text="Save", style="Sec.TButton",
+                   command=self._save_command).pack(side="left", padx=(0, 8))
+        # Vim toggle switch
+        self._vim_var = tk.BooleanVar(value=self.data.get("vim_mode", False))
+        vim_cb = tk.Checkbutton(
+            eb, text="Vim mode", variable=self._vim_var,
+            bg=BG2, fg=FG2, activebackground=BG2, activeforeground=FG,
+            selectcolor=BG3, font=FONT_TINY, cursor="hand2",
+            command=self._on_vim_toggle)
+        vim_cb.pack(side="left", padx=(0, 8))
+
         # Vim mode indicator (only visible when vim is active)
         self._vim_mode_label = tk.Label(
             eb, text="", bg=BG2, fg=ACCENT, width=8,
             font=(FONT_MONO[0], FONT_MONO[1], "bold"))
         self._vim_mode_label.pack(side="left", padx=(0, 6))
 
-        # Vim toggle switch
-        self._vim_var = tk.BooleanVar(value=self.data.get("vim_mode", False))
-        vim_cb = tk.Checkbutton(
-            eb, text="vim", variable=self._vim_var,
-            bg=BG2, fg=FG2, activebackground=BG2, activeforeground=FG,
-            selectcolor=BG3, font=FONT_TINY, cursor="hand2",
-            command=self._on_vim_toggle)
-        vim_cb.pack(side="left", padx=(0, 8))
 
-        ttk.Button(eb, text="Save", style="Sec.TButton",
-                   command=self._save_command).pack(side="left", padx=(0, 8))
         ttk.Button(eb, text="▶ Launch",   style="OrgBtn.TButton",
                    command=self._run_command).pack(side="right", padx=(4, 0))
         ttk.Button(eb, text="⟳ Relaunch", style="OrgBtn.TButton",

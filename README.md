@@ -15,6 +15,8 @@ Just specify the binaries path and models path, then create commands, choose the
 
 ![](./img/screen1.png)
 
+![](./img/screen2.png)
+
 
 ## How to Run
 
